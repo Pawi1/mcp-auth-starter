@@ -486,6 +486,6 @@ async def oauth_token(request: Request) -> JSONResponse:
     return JSONResponse({
         "access_token": token,
         "token_type": "bearer",
-        "expires_in": 86400,
+        "expires_in": int(86400 * ACCESS_TOKEN_EXPIRE_DAYS),
         "scope": "mcp",
     })

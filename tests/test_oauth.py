@@ -131,6 +131,12 @@ class TestOauthTokenInvalidCode:
         assert "access_token" in body
         assert body["token_type"] == "bearer"
 
+    def test_expires_in_matches_configured_token_lifetime(self, test_client, tmp_db, dummy_user):
+        from config import ACCESS_TOKEN_EXPIRE_DAYS
+        oauth_codes["ttl-code"] = {"redirect_uri": "", "state": "", "username": dummy_user, "issued_at": time.time()}
+        r = test_client.post("/oauth/token", data={"code": "ttl-code"})
+        assert r.json()["expires_in"] == 86400 * ACCESS_TOKEN_EXPIRE_DAYS
+
     def test_expired_code_returns_400(self, test_client, tmp_db, dummy_user):
         oauth_codes["stale-code"] = {
             "redirect_uri": "", "state": "", "username": dummy_user,
