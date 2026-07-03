@@ -60,10 +60,14 @@ def tmp_db(tmp_path, monkeypatch):
 def clean_in_memory():
     oauth_tokens.clear()
     oauth_codes.clear()
+    oauth_pending.clear()
+    oauth_clients.clear()
     _failed_attempts.clear()
     yield
     oauth_tokens.clear()
     oauth_codes.clear()
+    oauth_pending.clear()
+    oauth_clients.clear()
     _failed_attempts.clear()
 
 
