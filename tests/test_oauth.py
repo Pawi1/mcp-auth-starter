@@ -666,7 +666,12 @@ class TestOauthTokenClientAuth:
         assert r.status_code == 401
 
     def test_code_without_client_id_needs_no_auth(self, test_client, tmp_db, dummy_user):
-        # covers codes minted before this check existed / legacy in-memory state
+        # NOT a supported "public client" flow — every code minted by the real
+        # /oauth/authorize -> /oauth/login chain always carries a client_id
+        # (see oauth_login_post). This only exercises oauth_token's defensive
+        # `if info.get("client_id")` skip, which exists so a code injected
+        # without one (e.g. leftover in-memory state from before this check
+        # was added) doesn't hard-fail token exchange.
         oauth_codes["code5"] = {
             "redirect_uri": "", "state": "", "username": dummy_user, "issued_at": time.time(),
         }
@@ -734,6 +739,11 @@ class TestOauthTokenPkce:
         assert "access_token" in r.json()
 
     def test_code_without_challenge_needs_no_verifier(self, test_client, tmp_db, dummy_user):
+        # NOT a "PKCE optional" flow — every code minted via the real
+        # /oauth/authorize -> /oauth/login chain always carries a
+        # code_challenge (authorize rejects requests without one). This only
+        # exercises oauth_token's defensive `if info.get("code_challenge")`
+        # skip, for the same injected-code scenario as the client_id case above.
         oauth_codes["pkce4"] = {
             "redirect_uri": "", "state": "", "username": dummy_user, "issued_at": time.time(),
         }
