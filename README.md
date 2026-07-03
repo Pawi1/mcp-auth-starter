@@ -93,6 +93,17 @@ See `services/` for the systemd unit and env file template.
 - **A skills/plugin system**, business logic, or any domain-specific
   tools — that's the whole point of `server.py` being ~60 lines.
 
+## Security
+
+Auth/transport code, so bugs here are security bugs. See
+[SECURITY.md](SECURITY.md) for reporting a vulnerability, scope, and known
+tradeoffs (in-memory token/rate-limit caches don't scale across processes,
+no server-enforced PKCE, etc.).
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Origin
 
 This started as the auth/transport layer of a larger, private production
