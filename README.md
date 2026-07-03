@@ -50,10 +50,16 @@ first (creates `config.json`, a `SECRET_KEY`, and an admin user):
 cd app && python3 main.py --setup
 ```
 
+Claude.ai requires a public HTTPS URL for custom connectors — it won't
+accept `http://localhost:8000/mcp` directly. For local testing, expose
+your server with a [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/)
+(`cloudflared tunnel --url http://localhost:8000`) and use the `https://`
+URL it gives you.
+
 Then add this server as a connector in Claude.ai (Settings → Connectors →
-Add custom connector) with the URL `http://localhost:8000/mcp`. Claude.ai
-will discover the OAuth endpoints automatically, register itself as a
-client, and prompt you to log in with the admin account you just created.
+Add custom connector) with that URL plus `/mcp`. Claude.ai will discover
+the OAuth endpoints automatically, register itself as a client, and
+prompt you to log in with the admin account you just created.
 
 ## Adding your own tools
 
