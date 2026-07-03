@@ -42,9 +42,16 @@ generated secrets, default users, etc. as yours to secure per-deployment).
   shared storage or move to a real DB before scaling horizontally.
 - Rate limiting (`_check_rate_limit`) is in-memory and per-process, same
   caveat.
-- Authorization codes live for 60 seconds and are single-use, in-memory
-  only — they don't survive a server restart between `/oauth/authorize`
-  and `/oauth/token`.
+- Authorization codes and pending login transactions (`oauth_pending`,
+  keyed by `login_id`) are in-memory only, single-use, short-lived —
+  neither survives a server restart mid-flow. A restart between
+  `/oauth/authorize` and `/oauth/token` just means starting over.
+- Dynamic Client Registration is open by default — anyone can hit
+  `/oauth/clients/register` and get a `client_id`/`client_secret`
+  without approval. That's fine for "add this as a personal MCP
+  connector" use, but production deployments serving untrusted clients
+  may want an allowlist, admin approval, or a trusted-client policy in
+  front of it.
 
 ## Supported versions
 
