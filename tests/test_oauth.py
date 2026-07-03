@@ -34,6 +34,7 @@ from oauth import (
     load_tokens_from_db,
     oauth_clients,
     oauth_codes,
+    oauth_pending,
     oauth_tokens,
     revoke_tokens_for_user,
 )
@@ -415,6 +416,50 @@ class TestOauthAuthorize:
         )
         assert r.status_code == 400
 
+    def test_rejects_too_short_code_challenge(self, test_client, tmp_db):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
+        r = test_client.get(
+            f"/oauth/authorize?client_id={client['client_id']}&redirect_uri=http://localhost/cb"
+            f"&state=xyz&code_challenge=tooshort&code_challenge_method=S256"
+        )
+        assert r.status_code == 400
+
+    def test_rejects_code_challenge_with_invalid_chars(self, test_client, tmp_db):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
+        r = test_client.get("/oauth/authorize", params={
+            "client_id": client["client_id"], "redirect_uri": "http://localhost/cb",
+            "state": "xyz", "code_challenge": "!" * 43, "code_challenge_method": "S256",
+        })
+        assert r.status_code == 400
+
+    def test_two_flows_with_the_same_client_state_do_not_clobber_each_other(self, test_client, tmp_db):
+        # state is client-controlled and echoed back verbatim, never used as a
+        # lookup key — a client (or two different clients) reusing the same
+        # state value must not corrupt either flow's pending redirect_uri/PKCE.
+        oauth._ensure_tokens_table()
+        client_a = create_oauth_client("app-a", ["http://a.example/cb"])
+        client_b = create_oauth_client("app-b", ["http://b.example/cb"])
+        _, challenge_a = _pkce_pair()
+        _, challenge_b = _pkce_pair()
+
+        r_a = test_client.get(
+            f"/oauth/authorize?client_id={client_a['client_id']}&redirect_uri=http://a.example/cb"
+            f"&state=shared&code_challenge={challenge_a}&code_challenge_method=S256"
+        )
+        r_b = test_client.get(
+            f"/oauth/authorize?client_id={client_b['client_id']}&redirect_uri=http://b.example/cb"
+            f"&state=shared&code_challenge={challenge_b}&code_challenge_method=S256"
+        )
+        assert "login_id=" in r_a.headers["location"]
+        assert "login_id=" in r_b.headers["location"]
+        login_id_a = r_a.headers["location"].split("login_id=")[1].split("&")[0]
+        login_id_b = r_b.headers["location"].split("login_id=")[1].split("&")[0]
+        assert login_id_a != login_id_b
+        assert oauth_pending[login_id_a]["redirect_uri"] == "http://a.example/cb"
+        assert oauth_pending[login_id_b]["redirect_uri"] == "http://b.example/cb"
+
 
 class TestOauthLoginPost:
     def test_bad_password_redirects_with_error(self, test_client, tmp_db, dummy_user):
@@ -559,6 +604,22 @@ class TestOauthTokenClientAuth:
         r = test_client.post("/oauth/token", data={"code": "code5"})
         assert r.status_code == 200
 
+    def test_wrong_client_secret_does_not_consume_the_code(self, test_client, tmp_db, dummy_user):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
+        oauth_codes["code6"] = {
+            "redirect_uri": "http://localhost/cb", "state": "s", "username": dummy_user,
+            "issued_at": time.time(), "client_id": client["client_id"],
+        }
+        r1 = test_client.post("/oauth/token", data={
+            "code": "code6", "client_id": client["client_id"], "client_secret": "wrong",
+        })
+        assert r1.status_code == 401
+        r2 = test_client.post("/oauth/token", data={
+            "code": "code6", "client_id": client["client_id"], "client_secret": client["client_secret"],
+        })
+        assert r2.status_code == 200
+
 
 class TestOauthTokenPkce:
     def test_rejects_missing_code_verifier(self, test_client, tmp_db, dummy_user):
@@ -596,6 +657,17 @@ class TestOauthTokenPkce:
         }
         r = test_client.post("/oauth/token", data={"code": "pkce4"})
         assert r.status_code == 200
+
+    def test_wrong_verifier_does_not_consume_the_code(self, test_client, tmp_db, dummy_user):
+        verifier, challenge = _pkce_pair()
+        oauth_codes["pkce5"] = {
+            "redirect_uri": "", "state": "", "username": dummy_user,
+            "issued_at": time.time(), "code_challenge": challenge,
+        }
+        r1 = test_client.post("/oauth/token", data={"code": "pkce5", "code_verifier": "wrong"})
+        assert r1.status_code == 400
+        r2 = test_client.post("/oauth/token", data={"code": "pkce5", "code_verifier": verifier})
+        assert r2.status_code == 200
 
 
 class TestOauthFullFlowWithPkce:

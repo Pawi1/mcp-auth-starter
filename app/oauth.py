@@ -10,6 +10,7 @@ import hashlib
 import html as _html
 import json
 import logging
+import re
 import secrets
 import sqlite3
 import time
@@ -24,7 +25,7 @@ logger = logging.getLogger("mcp-auth-starter")
 
 oauth_tokens: dict = {}   # token → {issued_at, username}
 oauth_codes: dict = {}    # code → {redirect_uri, state, username, issued_at, client_id, code_challenge}
-oauth_pending: dict = {}  # state → {redirect_uri, client_id, state, code_challenge} — before login
+oauth_pending: dict = {}  # login_id → {redirect_uri, client_id, state, code_challenge} — before login
 oauth_clients: dict = {}  # client_id → {client_secret, name, redirect_uris}
 
 _failed_attempts: dict = {}  # ip → [timestamps of failed logins]
@@ -106,6 +107,14 @@ def _redirect_uri_valid(client_id: str, redirect_uri: str) -> bool:
         return True
     client = oauth_clients.get(client_id)
     return bool(client) and redirect_uri in client.get("redirect_uris", [])
+
+
+_CODE_CHALLENGE_RE = re.compile(r"[A-Za-z0-9\-._~]{43,128}")
+
+
+def _code_challenge_valid(code_challenge: str) -> bool:
+    """RFC 7636 §4.1 — 43-128 chars of unreserved URL-safe charset."""
+    return bool(code_challenge) and _CODE_CHALLENGE_RE.fullmatch(code_challenge) is not None
 
 
 def _pkce_challenge_from_verifier(code_verifier: str) -> str:
@@ -304,7 +313,7 @@ async def oauth_clients_register(request: Request) -> JSONResponse:
 async def oauth_authorize(request: Request) -> Response:
     from urllib.parse import quote
     redirect_uri = request.query_params.get("redirect_uri", "")
-    state = request.query_params.get("state", secrets.token_urlsafe(8))
+    state = request.query_params.get("state", "")
     client_id = request.query_params.get("client_id", "")
     code_challenge = request.query_params.get("code_challenge", "")
     code_challenge_method = request.query_params.get("code_challenge_method", "S256")
@@ -315,26 +324,33 @@ async def oauth_authorize(request: Request) -> Response:
             {"error": "invalid_request", "error_description": "redirect_uri is not registered for this client"},
             status_code=400,
         )
-    if not code_challenge or code_challenge_method != "S256":
+    if not _code_challenge_valid(code_challenge) or code_challenge_method != "S256":
         logger.warning(f"OAuth authorize rejected: missing/unsupported PKCE for client_id={client_id!r}")
         return JSONResponse(
             {"error": "invalid_request", "error_description": "code_challenge (S256) is required (PKCE, RFC 7636)"},
             status_code=400,
         )
 
-    oauth_pending[state] = {
+    # login_id is our own server-side transaction key — state is whatever the
+    # client sent (or omitted), just carried through and echoed back to them,
+    # never used to look anything up, so two flows sharing a state can't clobber
+    # each other's oauth_pending entry.
+    login_id = secrets.token_urlsafe(16)
+    oauth_pending[login_id] = {
         "redirect_uri": redirect_uri, "client_id": client_id, "state": state,
         "code_challenge": code_challenge,
     }
-    # pass redirect_uri/code_challenge in URL so login survives server restarts
+    # pass everything in the URL too, so login survives server restarts
     return RedirectResponse(
-        f"/oauth/login?state={state}&redirect_uri={quote(redirect_uri, safe='')}"
+        f"/oauth/login?login_id={login_id}&state={quote(state, safe='')}"
+        f"&redirect_uri={quote(redirect_uri, safe='')}"
         f"&client_id={quote(client_id, safe='')}&code_challenge={quote(code_challenge, safe='')}"
     )
 
 
 async def oauth_login(request: Request) -> Response:
     from urllib.parse import quote
+    login_id       = request.query_params.get("login_id", "")
     state          = request.query_params.get("state", "")
     redirect_uri   = request.query_params.get("redirect_uri", "")
     client_id      = request.query_params.get("client_id", "")
@@ -342,7 +358,7 @@ async def oauth_login(request: Request) -> Response:
     error          = request.query_params.get("error", "")
     error_html     = f'<div class="err">{_html.escape(error)}</div>' if error else ""
     action = (
-        f"/oauth/login?state={state}"
+        f"/oauth/login?login_id={login_id}&state={quote(state, safe='')}"
         f"&redirect_uri={quote(redirect_uri, safe='')}"
         f"&client_id={quote(client_id, safe='')}"
         f"&code_challenge={quote(code_challenge, safe='')}"
@@ -365,6 +381,7 @@ async def oauth_login(request: Request) -> Response:
 async def oauth_login_post(request: Request) -> Response:
     from urllib.parse import quote
     from users import log_login_attempt
+    login_id       = request.query_params.get("login_id", "")
     state          = request.query_params.get("state", "")
     redirect_uri   = request.query_params.get("redirect_uri", "")
     client_id      = request.query_params.get("client_id", "")
@@ -375,7 +392,7 @@ async def oauth_login_post(request: Request) -> Response:
     password       = str(form.get("password", ""))
 
     err_url = (
-        f"/oauth/login?state={state}&error=Invalid+username+or+password"
+        f"/oauth/login?login_id={login_id}&state={quote(state, safe='')}&error=Invalid+username+or+password"
         f"&redirect_uri={quote(redirect_uri, safe='')}&client_id={quote(client_id, safe='')}"
         f"&code_challenge={quote(code_challenge, safe='')}"
     )
@@ -384,7 +401,8 @@ async def oauth_login_post(request: Request) -> Response:
         logger.warning(f"Rate limit exceeded for IP {ip}")
         log_login_attempt(username, ip, success=False, reason="rate_limit")
         return RedirectResponse(
-            f"/oauth/login?state={state}&error=Too+many+attempts.+Wait+a+moment."
+            f"/oauth/login?login_id={login_id}&state={quote(state, safe='')}"
+            f"&error=Too+many+attempts.+Wait+a+moment."
             f"&redirect_uri={quote(redirect_uri, safe='')}&client_id={quote(client_id, safe='')}"
             f"&code_challenge={quote(code_challenge, safe='')}",
             status_code=303,
@@ -397,10 +415,11 @@ async def oauth_login_post(request: Request) -> Response:
         return RedirectResponse(err_url, status_code=303)
 
     # prefer in-memory pending, fall back to URL params (survives restarts)
-    pending = oauth_pending.pop(state, {})
+    pending = oauth_pending.pop(login_id, {})
     redirect_uri = pending.get("redirect_uri") or redirect_uri
     client_id = pending.get("client_id") or client_id
     code_challenge = pending.get("code_challenge") or code_challenge
+    state = pending.get("state", state)
 
     if not _redirect_uri_valid(client_id, redirect_uri):
         logger.warning(f"OAuth login rejected: unregistered redirect_uri for client_id={client_id!r}")
@@ -408,7 +427,7 @@ async def oauth_login_post(request: Request) -> Response:
             {"error": "invalid_request", "error_description": "redirect_uri is not registered for this client"},
             status_code=400,
         )
-    if not code_challenge:
+    if not _code_challenge_valid(code_challenge):
         logger.warning(f"OAuth login rejected: missing PKCE code_challenge for client_id={client_id!r}")
         return JSONResponse(
             {"error": "invalid_request", "error_description": "code_challenge (S256) is required (PKCE, RFC 7636)"},
@@ -448,8 +467,11 @@ async def oauth_token(request: Request) -> JSONResponse:
         # client_secret_basic (RFC 6749 §2.3.1) instead of client_secret_post
         client_id, client_secret = _parse_basic_auth(request.headers.get("authorization", ""))
 
-    info = oauth_codes.pop(code, None)
+    # peek, don't consume yet — a wrong client_secret or code_verifier
+    # shouldn't burn a code that's still legitimately redeemable within its TTL
+    info = oauth_codes.get(code)
     if not info or time.time() - info["issued_at"] > _AUTH_CODE_TTL:
+        oauth_codes.pop(code, None)
         return JSONResponse(
             {"error": "invalid_grant", "error_description": "Invalid or expired authorization code"},
             status_code=400,
@@ -478,6 +500,7 @@ async def oauth_token(request: Request) -> JSONResponse:
                 status_code=400,
             )
 
+    oauth_codes.pop(code, None)
     token = issue_token(info["username"])
     return JSONResponse({
         "access_token": token,

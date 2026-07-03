@@ -12,7 +12,7 @@ normal browser login. No manual token pasting, no bypassing OAuth with a
 "just give me a token" shortcut that quietly stops working the moment you
 add real revocation.
 
-This is *not* a framework — it's ~600 lines of plain Starlette you're meant
+This is *not* a framework — it's ~1100 lines of plain Starlette you're meant
 to read, fork, and build on. There's exactly one demo tool (`whoami`) to
 prove the auth chain works end to end. Your actual tools go in `app/server.py`.
 
@@ -79,9 +79,9 @@ if name == "my_tool":
 make test
 ```
 
-87 tests, ~70% line coverage. `app/config.py` and the interactive CLI
-wizard (`--setup`/`--adduser`) are the main gaps — they're either constants
-or `input()`-driven, both low value to unit test.
+111 tests, ~70% line coverage (`pytest --cov=app`). `app/config.py` and the
+interactive CLI wizard (`--setup`/`--adduser`) are the main gaps — they're
+either constants or `input()`-driven, both low value to unit test.
 
 ## Deployment
 
