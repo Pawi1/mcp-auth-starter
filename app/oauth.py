@@ -5,6 +5,7 @@ and other MCP clients to add this server as a connector with a normal
 browser login, no manual token pasting required.
 """
 
+import base64
 import html as _html
 import json
 import logging
@@ -104,6 +105,18 @@ def _redirect_uri_valid(client_id: str, redirect_uri: str) -> bool:
         return True
     client = oauth_clients.get(client_id)
     return bool(client) and redirect_uri in client.get("redirect_uris", [])
+
+
+def _parse_basic_auth(header: str) -> tuple:
+    """Decode an `Authorization: Basic base64(client_id:client_secret)` header."""
+    if not header.startswith("Basic "):
+        return "", ""
+    try:
+        decoded = base64.b64decode(header[len("Basic "):]).decode("utf-8")
+        client_id, _, client_secret = decoded.partition(":")
+        return client_id, client_secret
+    except Exception:
+        return "", ""
 
 
 def issue_token(username: str) -> str:
@@ -373,7 +386,10 @@ async def oauth_login_post(request: Request) -> Response:
 
     log_login_attempt(username, ip, success=True)
     code = secrets.token_urlsafe(16)
-    oauth_codes[code] = {"redirect_uri": redirect_uri, "state": state, "username": username, "issued_at": time.time()}
+    oauth_codes[code] = {
+        "redirect_uri": redirect_uri, "state": state, "username": username,
+        "issued_at": time.time(), "client_id": client_id,
+    }
     logger.info(f"OAuth login successful: {username}")
 
     if redirect_uri:
@@ -386,10 +402,18 @@ async def oauth_token(request: Request) -> JSONResponse:
     try:
         form = await request.form()
         code = str(form.get("code", ""))
+        client_id = str(form.get("client_id", ""))
+        client_secret = str(form.get("client_secret", ""))
     except Exception:
         body = await request.body()
         data = json.loads(body) if body else {}
         code = data.get("code", "")
+        client_id = data.get("client_id", "")
+        client_secret = data.get("client_secret", "")
+
+    if not client_id:
+        # client_secret_basic (RFC 6749 §2.3.1) instead of client_secret_post
+        client_id, client_secret = _parse_basic_auth(request.headers.get("authorization", ""))
 
     info = oauth_codes.pop(code, None)
     if not info or time.time() - info["issued_at"] > _AUTH_CODE_TTL:
@@ -397,6 +421,22 @@ async def oauth_token(request: Request) -> JSONResponse:
             {"error": "invalid_grant", "error_description": "Invalid or expired authorization code"},
             status_code=400,
         )
+
+    # codes minted for a registered client must be redeemed by that same,
+    # authenticated client — otherwise a leaked code is bearer-usable by anyone
+    if info.get("client_id"):
+        client = oauth_clients.get(client_id)
+        if (
+            client_id != info["client_id"]
+            or not client
+            or not secrets.compare_digest(client_secret, client["client_secret"])
+        ):
+            logger.warning(f"OAuth token rejected: client authentication failed for client_id={client_id!r}")
+            return JSONResponse(
+                {"error": "invalid_client", "error_description": "Client authentication failed"},
+                status_code=401,
+            )
+
     token = issue_token(info["username"])
     return JSONResponse({
         "access_token": token,

@@ -443,6 +443,72 @@ class TestOauthLoginPost:
         assert r.status_code in (200, 302, 303)
 
 
+class TestOauthTokenClientAuth:
+    def test_rejects_wrong_client_secret(self, test_client, tmp_db, dummy_user):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
+        oauth_codes["code1"] = {
+            "redirect_uri": "http://localhost/cb", "state": "s", "username": dummy_user,
+            "issued_at": time.time(), "client_id": client["client_id"],
+        }
+        r = test_client.post("/oauth/token", data={
+            "code": "code1", "client_id": client["client_id"], "client_secret": "wrong",
+        })
+        assert r.status_code == 401
+        assert r.json()["error"] == "invalid_client"
+
+    def test_accepts_client_secret_post(self, test_client, tmp_db, dummy_user):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
+        oauth_codes["code2"] = {
+            "redirect_uri": "http://localhost/cb", "state": "s", "username": dummy_user,
+            "issued_at": time.time(), "client_id": client["client_id"],
+        }
+        r = test_client.post("/oauth/token", data={
+            "code": "code2", "client_id": client["client_id"], "client_secret": client["client_secret"],
+        })
+        assert r.status_code == 200
+        assert "access_token" in r.json()
+
+    def test_accepts_client_secret_basic(self, test_client, tmp_db, dummy_user):
+        import base64
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
+        oauth_codes["code3"] = {
+            "redirect_uri": "http://localhost/cb", "state": "s", "username": dummy_user,
+            "issued_at": time.time(), "client_id": client["client_id"],
+        }
+        creds = base64.b64encode(f"{client['client_id']}:{client['client_secret']}".encode()).decode()
+        r = test_client.post(
+            "/oauth/token",
+            data={"code": "code3"},
+            headers={"Authorization": f"Basic {creds}"},
+        )
+        assert r.status_code == 200
+        assert "access_token" in r.json()
+
+    def test_rejects_code_redeemed_by_a_different_client(self, test_client, tmp_db, dummy_user):
+        oauth._ensure_tokens_table()
+        owner = create_oauth_client("owner-app", ["http://localhost/cb"])
+        attacker = create_oauth_client("attacker-app", ["http://evil.example/cb"])
+        oauth_codes["code4"] = {
+            "redirect_uri": "http://localhost/cb", "state": "s", "username": dummy_user,
+            "issued_at": time.time(), "client_id": owner["client_id"],
+        }
+        r = test_client.post("/oauth/token", data={
+            "code": "code4", "client_id": attacker["client_id"], "client_secret": attacker["client_secret"],
+        })
+        assert r.status_code == 401
+
+    def test_code_without_client_id_needs_no_auth(self, test_client, tmp_db, dummy_user):
+        # covers codes minted before this check existed / legacy in-memory state
+        oauth_codes["code5"] = {
+            "redirect_uri": "", "state": "", "username": dummy_user, "issued_at": time.time(),
+        }
+        r = test_client.post("/oauth/token", data={"code": "code5"})
+        assert r.status_code == 200
+
+
 class TestOauthTokenJsonBody:
     def test_starlette_returns_empty_form_for_json_content_type(self, test_client):
         # Starlette 1.x returns empty FormData for application/json content-type
