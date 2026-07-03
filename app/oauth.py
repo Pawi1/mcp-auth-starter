@@ -387,14 +387,29 @@ async def oauth_login(request: Request) -> Response:
     login_id = request.query_params.get("login_id", "")
     error    = request.query_params.get("error", "")
 
-    if _get_pending(login_id) is None:
+    pending = _get_pending(login_id)
+    if pending is None:
         return _expired_login_page()
+
+    # so the person logging in can see what they're actually authorizing —
+    # DCR is open, so this is the only signal a user gets before their
+    # credentials hand an authorization code to whichever app asked for it
+    client = oauth_clients.get(pending["client_id"])
+    client_name = _html.escape(client["name"] if client else "an unregistered application")
+    redirect_display = _html.escape(pending["redirect_uri"]) if pending["redirect_uri"] else "this page (no redirect)"
+    consent_html = f"""
+<div class="info">
+  <strong>{client_name}</strong> wants to sign in as you.<br>
+  You'll be redirected to: <code>{redirect_display}</code>
+</div>
+"""
 
     error_html = f'<div class="err">{_html.escape(error)}</div>' if error else ""
     action = f"/oauth/login?login_id={login_id}"
     body = f"""
 <h2>Sign in</h2>
 <p class="sub">Connect your AI assistant to this MCP server</p>
+{consent_html}
 {error_html}
 <form method="post" action="{action}">
   <label>Username</label>

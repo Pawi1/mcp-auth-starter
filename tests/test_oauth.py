@@ -314,6 +314,33 @@ class TestOauthLoginXssProtection:
         assert r.status_code == 400
         assert "expired" in r.text.lower()
 
+
+class TestOauthLoginConsent:
+    def test_shows_registered_client_name_and_redirect_uri(self, test_client, tmp_db):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("My Cool App", ["http://localhost/cb"])
+        login_id = _seed_pending(redirect_uri="http://localhost/cb", client_id=client["client_id"])
+        r = test_client.get(f"/oauth/login?login_id={login_id}")
+        assert "My Cool App" in r.text
+        assert "http://localhost/cb" in r.text
+
+    def test_escapes_malicious_client_name(self, test_client, tmp_db):
+        # client_name comes straight from open DCR registration — must not
+        # let a malicious client XSS the login page it's asking users to sign in on
+        oauth._ensure_tokens_table()
+        payload = "<script>alert(1)</script>"
+        client = create_oauth_client(payload, ["http://localhost/cb"])
+        login_id = _seed_pending(redirect_uri="http://localhost/cb", client_id=client["client_id"])
+        r = test_client.get(f"/oauth/login?login_id={login_id}")
+        assert "<script>" not in r.text
+        assert html.escape(payload) in r.text
+
+    def test_unregistered_client_shows_generic_warning(self, test_client, tmp_db):
+        login_id = _seed_pending(redirect_uri="", client_id="nonexistent-client")
+        r = test_client.get(f"/oauth/login?login_id={login_id}")
+        assert r.status_code == 200
+        assert "unregistered application" in r.text.lower()
+
     def test_stale_login_id_shows_expired_page(self, test_client):
         login_id = _seed_pending(issued_at=time.time() - oauth._LOGIN_TTL - 1)
         r = test_client.get(f"/oauth/login?login_id={login_id}")
