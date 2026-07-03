@@ -93,6 +93,14 @@ See `services/` for the systemd unit and env file template.
 - **A skills/plugin system**, business logic, or any domain-specific
   tools — that's the whole point of `server.py` being ~60 lines.
 
+## Origin
+
+This started as the auth/transport layer of a larger, private production
+MCP server I maintain — extracted, genericized, and stripped of every bit
+of that server's domain-specific logic. What's here is just the part that's
+generically useful to anyone standing up their own MCP server: a working
+OAuth 2.0 + JWT implementation you don't have to build from scratch.
+
 ## License
 
-Not yet decided — add one before you publish this anywhere.
+MIT — see [LICENSE](LICENSE).
