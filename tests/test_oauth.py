@@ -575,6 +575,7 @@ class TestOauthLoginPost:
                 data={"username": dummy_user, "password": "WRONG"},
             )
             assert r1.status_code in (302, 303)
+            assert login_id in oauth_pending
             r2 = test_client.post(
                 f"/oauth/login?login_id={login_id}",
                 data={"username": dummy_user, "password": "password123"},
@@ -659,6 +660,7 @@ class TestOauthTokenClientAuth:
             "code": "code6", "client_id": client["client_id"], "client_secret": "wrong",
         })
         assert r1.status_code == 401
+        assert "code6" in oauth_codes
         r2 = test_client.post("/oauth/token", data={
             "code": "code6", "client_id": client["client_id"], "client_secret": client["client_secret"],
         })
@@ -710,6 +712,7 @@ class TestOauthTokenPkce:
         }
         r1 = test_client.post("/oauth/token", data={"code": "pkce5", "code_verifier": "wrong"})
         assert r1.status_code == 400
+        assert "pkce5" in oauth_codes
         r2 = test_client.post("/oauth/token", data={"code": "pkce5", "code_verifier": verifier})
         assert r2.status_code == 200
 
