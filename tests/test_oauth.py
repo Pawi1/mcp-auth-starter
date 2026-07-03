@@ -333,14 +333,42 @@ class TestOauthClientsRegister:
 
 
 class TestOauthAuthorize:
-    def test_redirects_to_login(self, test_client):
-        r = test_client.get("/oauth/authorize?client_id=abc&redirect_uri=http://localhost/cb&state=xyz")
+    def test_redirects_to_login(self, test_client, tmp_db):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
+        r = test_client.get(
+            f"/oauth/authorize?client_id={client['client_id']}&redirect_uri=http://localhost/cb&state=xyz"
+        )
         assert r.status_code in (302, 303, 307)
         assert "/oauth/login" in r.headers["location"]
 
-    def test_state_preserved_in_redirect(self, test_client):
-        r = test_client.get("/oauth/authorize?state=mystate&redirect_uri=http://localhost/cb&client_id=x")
+    def test_state_preserved_in_redirect(self, test_client, tmp_db):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
+        r = test_client.get(
+            f"/oauth/authorize?state=mystate&redirect_uri=http://localhost/cb&client_id={client['client_id']}"
+        )
         assert "mystate" in r.headers["location"]
+
+    def test_rejects_unregistered_redirect_uri(self, test_client, tmp_db):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
+        r = test_client.get(
+            f"/oauth/authorize?client_id={client['client_id']}&redirect_uri=http://evil.example/cb&state=xyz"
+        )
+        assert r.status_code == 400
+
+    def test_rejects_unknown_client_id(self, test_client, tmp_db):
+        oauth._ensure_tokens_table()
+        r = test_client.get(
+            "/oauth/authorize?client_id=nonexistent&redirect_uri=http://localhost/cb&state=xyz"
+        )
+        assert r.status_code == 400
+
+    def test_allows_empty_redirect_uri(self, test_client, tmp_db):
+        oauth._ensure_tokens_table()
+        r = test_client.get("/oauth/authorize?client_id=whatever&redirect_uri=&state=xyz")
+        assert r.status_code in (302, 303, 307)
 
 
 class TestOauthLoginPost:
@@ -375,15 +403,27 @@ class TestOauthLoginPost:
         assert "error" in r.headers["location"].lower()
 
     def test_success_with_redirect_uri(self, test_client, tmp_db, dummy_user):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
         with patch("users.log_login_attempt"):
             r = test_client.post(
-                "/oauth/login?state=mystate&redirect_uri=http://localhost/cb&client_id=c",
+                f"/oauth/login?state=mystate&redirect_uri=http://localhost/cb&client_id={client['client_id']}",
                 data={"username": dummy_user, "password": "password123"},
             )
         assert r.status_code in (302, 303)
         loc = r.headers["location"]
         assert "code=" in loc
         assert "mystate" in loc
+
+    def test_rejects_unregistered_redirect_uri(self, test_client, tmp_db, dummy_user):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
+        with patch("users.log_login_attempt"):
+            r = test_client.post(
+                f"/oauth/login?state=mystate&redirect_uri=http://evil.example/cb&client_id={client['client_id']}",
+                data={"username": dummy_user, "password": "password123"},
+            )
+        assert r.status_code == 400
 
     def test_success_without_redirect_shows_html(self, test_client, tmp_db, dummy_user):
         with patch("users.log_login_attempt"):

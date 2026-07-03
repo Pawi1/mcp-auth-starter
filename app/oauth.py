@@ -28,6 +28,7 @@ oauth_clients: dict = {}  # client_id → {client_secret, name}
 _failed_attempts: dict = {}  # ip → [timestamps of failed logins]
 _RATE_LIMIT = 5              # max failed attempts per window
 _RATE_WINDOW = 60            # seconds
+_AUTH_CODE_TTL = 60          # seconds an authorization code stays redeemable
 
 
 def _check_rate_limit(ip: str) -> bool:
@@ -64,10 +65,14 @@ def _ensure_tokens_table():
 def load_clients_from_db():
     try:
         conn = sqlite3.connect(str(DB_PATH))
-        rows = conn.execute("SELECT client_id, client_secret, name FROM oauth_clients").fetchall()
+        rows = conn.execute("SELECT client_id, client_secret, name, redirect_uris FROM oauth_clients").fetchall()
         conn.close()
-        for client_id, client_secret, name in rows:
-            oauth_clients[client_id] = {"client_secret": client_secret, "name": name}
+        for client_id, client_secret, name, redirect_uris in rows:
+            oauth_clients[client_id] = {
+                "client_secret": client_secret,
+                "name": name,
+                "redirect_uris": json.loads(redirect_uris or "[]"),
+            }
         logger.info(f"Loaded {len(rows)} OAuth client(s) from DB")
     except Exception as e:
         logger.warning(f"OAuth clients DB load failed: {e}")
@@ -77,15 +82,28 @@ def create_oauth_client(name: str, redirect_uris: list = None) -> dict:
     client_id = secrets.token_urlsafe(16)
     client_secret = secrets.token_urlsafe(32)
     now = time.time()
-    uris = json.dumps(redirect_uris or [])
+    uris = redirect_uris or []
     conn = sqlite3.connect(str(DB_PATH))
     conn.execute("INSERT INTO oauth_clients VALUES (?,?,?,?,?)",
-                 (client_id, client_secret, name, uris, now))
+                 (client_id, client_secret, name, json.dumps(uris), now))
     conn.commit()
     conn.close()
-    oauth_clients[client_id] = {"client_secret": client_secret, "name": name}
+    oauth_clients[client_id] = {"client_secret": client_secret, "name": name, "redirect_uris": uris}
     logger.info(f"Created OAuth client: {name} ({client_id})")
     return {"client_id": client_id, "client_secret": client_secret, "name": name}
+
+
+def _redirect_uri_valid(client_id: str, redirect_uri: str) -> bool:
+    """RFC 6749 §3.1.2.3 — redirect_uri must exactly match one registered for the client.
+
+    An empty redirect_uri is allowed: it means the flow ends with the
+    in-browser "signed in" page instead of a redirect, so there's nothing
+    to validate against.
+    """
+    if not redirect_uri:
+        return True
+    client = oauth_clients.get(client_id)
+    return bool(client) and redirect_uri in client.get("redirect_uris", [])
 
 
 def issue_token(username: str) -> str:
@@ -268,6 +286,14 @@ async def oauth_authorize(request: Request) -> Response:
     redirect_uri = request.query_params.get("redirect_uri", "")
     state = request.query_params.get("state", secrets.token_urlsafe(8))
     client_id = request.query_params.get("client_id", "")
+
+    if not _redirect_uri_valid(client_id, redirect_uri):
+        logger.warning(f"OAuth authorize rejected: unregistered redirect_uri for client_id={client_id!r}")
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "redirect_uri is not registered for this client"},
+            status_code=400,
+        )
+
     oauth_pending[state] = {"redirect_uri": redirect_uri, "client_id": client_id, "state": state}
     # pass redirect_uri in URL so login survives server restarts
     return RedirectResponse(
@@ -336,6 +362,14 @@ async def oauth_login_post(request: Request) -> Response:
     # prefer in-memory pending, fall back to URL params (survives restarts)
     pending = oauth_pending.pop(state, {})
     redirect_uri = pending.get("redirect_uri") or redirect_uri
+    client_id = pending.get("client_id") or client_id
+
+    if not _redirect_uri_valid(client_id, redirect_uri):
+        logger.warning(f"OAuth login rejected: unregistered redirect_uri for client_id={client_id!r}")
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "redirect_uri is not registered for this client"},
+            status_code=400,
+        )
 
     log_login_attempt(username, ip, success=True)
     code = secrets.token_urlsafe(16)
