@@ -373,7 +373,7 @@ async def oauth_login_post(request: Request) -> Response:
 
     log_login_attempt(username, ip, success=True)
     code = secrets.token_urlsafe(16)
-    oauth_codes[code] = {"redirect_uri": redirect_uri, "state": state, "username": username}
+    oauth_codes[code] = {"redirect_uri": redirect_uri, "state": state, "username": username, "issued_at": time.time()}
     logger.info(f"OAuth login successful: {username}")
 
     if redirect_uri:
@@ -392,7 +392,7 @@ async def oauth_token(request: Request) -> JSONResponse:
         code = data.get("code", "")
 
     info = oauth_codes.pop(code, None)
-    if not info:
+    if not info or time.time() - info["issued_at"] > _AUTH_CODE_TTL:
         return JSONResponse(
             {"error": "invalid_grant", "error_description": "Invalid or expired authorization code"},
             status_code=400,

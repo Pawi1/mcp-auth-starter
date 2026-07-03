@@ -94,7 +94,7 @@ class TestOauthTokenInvalidCode:
         assert r.json()["error"] == "invalid_grant"
 
     def test_already_used_code_returns_400(self, test_client, tmp_db, dummy_user):
-        oauth_codes["used-code"] = {"redirect_uri": "", "state": "", "username": dummy_user}
+        oauth_codes["used-code"] = {"redirect_uri": "", "state": "", "username": dummy_user, "issued_at": time.time()}
         r1 = test_client.post("/oauth/token", data={"code": "used-code"})
         assert r1.status_code == 200
         r2 = test_client.post("/oauth/token", data={"code": "used-code"})
@@ -105,12 +105,21 @@ class TestOauthTokenInvalidCode:
         assert r.status_code == 400
 
     def test_valid_code_issues_token(self, test_client, tmp_db, dummy_user):
-        oauth_codes["valid-code"] = {"redirect_uri": "", "state": "", "username": dummy_user}
+        oauth_codes["valid-code"] = {"redirect_uri": "", "state": "", "username": dummy_user, "issued_at": time.time()}
         r = test_client.post("/oauth/token", data={"code": "valid-code"})
         assert r.status_code == 200
         body = r.json()
         assert "access_token" in body
         assert body["token_type"] == "bearer"
+
+    def test_expired_code_returns_400(self, test_client, tmp_db, dummy_user):
+        oauth_codes["stale-code"] = {
+            "redirect_uri": "", "state": "", "username": dummy_user,
+            "issued_at": time.time() - oauth._AUTH_CODE_TTL - 1,
+        }
+        r = test_client.post("/oauth/token", data={"code": "stale-code"})
+        assert r.status_code == 400
+        assert r.json()["error"] == "invalid_grant"
 
     def test_no_anonymous_token_on_bad_code(self, test_client):
         r = test_client.post("/oauth/token", data={"code": "garbage"})
