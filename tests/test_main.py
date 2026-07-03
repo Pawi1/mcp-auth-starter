@@ -94,13 +94,14 @@ class TestHandleMcpAuth:
         assert resp.status_code == 200
         assert resp.content == b"ok"
 
-    def test_token_via_query_param(self, client, tmp_db):
+    def test_token_via_query_param_rejected(self, client, tmp_db):
+        # MCP spec requires the Authorization header; a token in the query
+        # string must not be accepted (it'd end up in access/proxy logs).
         token = _make_token(username="bob", teams=["admins"])
         _register_token(tmp_db, token, username="bob")
 
-        with patch.object(main.session_manager, "handle_request", side_effect=_fake_handle_request):
-            resp = client.post("/mcp", params={"token": token})
-        assert resp.status_code == 200
+        resp = client.post("/mcp", params={"token": token})
+        assert resp.status_code == 401
 
 
 class TestHealth:

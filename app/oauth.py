@@ -6,6 +6,7 @@ browser login, no manual token pasting required.
 """
 
 import base64
+import hashlib
 import html as _html
 import json
 import logging
@@ -22,9 +23,9 @@ from users import verify_user
 logger = logging.getLogger("mcp-auth-starter")
 
 oauth_tokens: dict = {}   # token → {issued_at, username}
-oauth_codes: dict = {}    # code → {redirect_uri, state, username}
-oauth_pending: dict = {}  # state → {redirect_uri, client_id, state} — before login
-oauth_clients: dict = {}  # client_id → {client_secret, name}
+oauth_codes: dict = {}    # code → {redirect_uri, state, username, issued_at, client_id, code_challenge}
+oauth_pending: dict = {}  # state → {redirect_uri, client_id, state, code_challenge} — before login
+oauth_clients: dict = {}  # client_id → {client_secret, name, redirect_uris}
 
 _failed_attempts: dict = {}  # ip → [timestamps of failed logins]
 _RATE_LIMIT = 5              # max failed attempts per window
@@ -105,6 +106,12 @@ def _redirect_uri_valid(client_id: str, redirect_uri: str) -> bool:
         return True
     client = oauth_clients.get(client_id)
     return bool(client) and redirect_uri in client.get("redirect_uris", [])
+
+
+def _pkce_challenge_from_verifier(code_verifier: str) -> str:
+    """RFC 7636 §4.2 — S256 transform of a PKCE code_verifier."""
+    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
 
 def _parse_basic_auth(header: str) -> tuple:
@@ -299,6 +306,8 @@ async def oauth_authorize(request: Request) -> Response:
     redirect_uri = request.query_params.get("redirect_uri", "")
     state = request.query_params.get("state", secrets.token_urlsafe(8))
     client_id = request.query_params.get("client_id", "")
+    code_challenge = request.query_params.get("code_challenge", "")
+    code_challenge_method = request.query_params.get("code_challenge_method", "S256")
 
     if not _redirect_uri_valid(client_id, redirect_uri):
         logger.warning(f"OAuth authorize rejected: unregistered redirect_uri for client_id={client_id!r}")
@@ -306,25 +315,37 @@ async def oauth_authorize(request: Request) -> Response:
             {"error": "invalid_request", "error_description": "redirect_uri is not registered for this client"},
             status_code=400,
         )
+    if not code_challenge or code_challenge_method != "S256":
+        logger.warning(f"OAuth authorize rejected: missing/unsupported PKCE for client_id={client_id!r}")
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "code_challenge (S256) is required (PKCE, RFC 7636)"},
+            status_code=400,
+        )
 
-    oauth_pending[state] = {"redirect_uri": redirect_uri, "client_id": client_id, "state": state}
-    # pass redirect_uri in URL so login survives server restarts
+    oauth_pending[state] = {
+        "redirect_uri": redirect_uri, "client_id": client_id, "state": state,
+        "code_challenge": code_challenge,
+    }
+    # pass redirect_uri/code_challenge in URL so login survives server restarts
     return RedirectResponse(
-        f"/oauth/login?state={state}&redirect_uri={quote(redirect_uri, safe='')}&client_id={quote(client_id, safe='')}"
+        f"/oauth/login?state={state}&redirect_uri={quote(redirect_uri, safe='')}"
+        f"&client_id={quote(client_id, safe='')}&code_challenge={quote(code_challenge, safe='')}"
     )
 
 
 async def oauth_login(request: Request) -> Response:
     from urllib.parse import quote
-    state        = request.query_params.get("state", "")
-    redirect_uri = request.query_params.get("redirect_uri", "")
-    client_id    = request.query_params.get("client_id", "")
-    error        = request.query_params.get("error", "")
-    error_html   = f'<div class="err">{_html.escape(error)}</div>' if error else ""
+    state          = request.query_params.get("state", "")
+    redirect_uri   = request.query_params.get("redirect_uri", "")
+    client_id      = request.query_params.get("client_id", "")
+    code_challenge = request.query_params.get("code_challenge", "")
+    error          = request.query_params.get("error", "")
+    error_html     = f'<div class="err">{_html.escape(error)}</div>' if error else ""
     action = (
         f"/oauth/login?state={state}"
         f"&redirect_uri={quote(redirect_uri, safe='')}"
         f"&client_id={quote(client_id, safe='')}"
+        f"&code_challenge={quote(code_challenge, safe='')}"
     )
     body = f"""
 <h2>Sign in</h2>
@@ -344,17 +365,19 @@ async def oauth_login(request: Request) -> Response:
 async def oauth_login_post(request: Request) -> Response:
     from urllib.parse import quote
     from users import log_login_attempt
-    state        = request.query_params.get("state", "")
-    redirect_uri = request.query_params.get("redirect_uri", "")
-    client_id    = request.query_params.get("client_id", "")
-    ip           = request.client.host if request.client else "unknown"
-    form         = await request.form()
-    username     = str(form.get("username", "")).strip()
-    password     = str(form.get("password", ""))
+    state          = request.query_params.get("state", "")
+    redirect_uri   = request.query_params.get("redirect_uri", "")
+    client_id      = request.query_params.get("client_id", "")
+    code_challenge = request.query_params.get("code_challenge", "")
+    ip             = request.client.host if request.client else "unknown"
+    form           = await request.form()
+    username       = str(form.get("username", "")).strip()
+    password       = str(form.get("password", ""))
 
     err_url = (
         f"/oauth/login?state={state}&error=Invalid+username+or+password"
         f"&redirect_uri={quote(redirect_uri, safe='')}&client_id={quote(client_id, safe='')}"
+        f"&code_challenge={quote(code_challenge, safe='')}"
     )
 
     if not _check_rate_limit(ip):
@@ -362,7 +385,8 @@ async def oauth_login_post(request: Request) -> Response:
         log_login_attempt(username, ip, success=False, reason="rate_limit")
         return RedirectResponse(
             f"/oauth/login?state={state}&error=Too+many+attempts.+Wait+a+moment."
-            f"&redirect_uri={quote(redirect_uri, safe='')}&client_id={quote(client_id, safe='')}",
+            f"&redirect_uri={quote(redirect_uri, safe='')}&client_id={quote(client_id, safe='')}"
+            f"&code_challenge={quote(code_challenge, safe='')}",
             status_code=303,
         )
 
@@ -376,6 +400,7 @@ async def oauth_login_post(request: Request) -> Response:
     pending = oauth_pending.pop(state, {})
     redirect_uri = pending.get("redirect_uri") or redirect_uri
     client_id = pending.get("client_id") or client_id
+    code_challenge = pending.get("code_challenge") or code_challenge
 
     if not _redirect_uri_valid(client_id, redirect_uri):
         logger.warning(f"OAuth login rejected: unregistered redirect_uri for client_id={client_id!r}")
@@ -383,12 +408,18 @@ async def oauth_login_post(request: Request) -> Response:
             {"error": "invalid_request", "error_description": "redirect_uri is not registered for this client"},
             status_code=400,
         )
+    if not code_challenge:
+        logger.warning(f"OAuth login rejected: missing PKCE code_challenge for client_id={client_id!r}")
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "code_challenge (S256) is required (PKCE, RFC 7636)"},
+            status_code=400,
+        )
 
     log_login_attempt(username, ip, success=True)
     code = secrets.token_urlsafe(16)
     oauth_codes[code] = {
         "redirect_uri": redirect_uri, "state": state, "username": username,
-        "issued_at": time.time(), "client_id": client_id,
+        "issued_at": time.time(), "client_id": client_id, "code_challenge": code_challenge,
     }
     logger.info(f"OAuth login successful: {username}")
 
@@ -404,12 +435,14 @@ async def oauth_token(request: Request) -> JSONResponse:
         code = str(form.get("code", ""))
         client_id = str(form.get("client_id", ""))
         client_secret = str(form.get("client_secret", ""))
+        code_verifier = str(form.get("code_verifier", ""))
     except Exception:
         body = await request.body()
         data = json.loads(body) if body else {}
         code = data.get("code", "")
         client_id = data.get("client_id", "")
         client_secret = data.get("client_secret", "")
+        code_verifier = data.get("code_verifier", "")
 
     if not client_id:
         # client_secret_basic (RFC 6749 §2.3.1) instead of client_secret_post
@@ -435,6 +468,14 @@ async def oauth_token(request: Request) -> JSONResponse:
             return JSONResponse(
                 {"error": "invalid_client", "error_description": "Client authentication failed"},
                 status_code=401,
+            )
+
+    if info.get("code_challenge"):
+        if not code_verifier or _pkce_challenge_from_verifier(code_verifier) != info["code_challenge"]:
+            logger.warning("OAuth token rejected: PKCE verification failed")
+            return JSONResponse(
+                {"error": "invalid_grant", "error_description": "PKCE verification failed"},
+                status_code=400,
             )
 
     token = issue_token(info["username"])

@@ -97,8 +97,8 @@ See `services/` for the systemd unit and env file template.
 
 Auth/transport code, so bugs here are security bugs. See
 [SECURITY.md](SECURITY.md) for reporting a vulnerability, scope, and known
-tradeoffs (in-memory token/rate-limit caches don't scale across processes,
-no server-enforced PKCE, etc.).
+tradeoffs (in-memory token/rate-limit/auth-code caches don't scale across
+processes, etc.).
 
 ## Contributing
 

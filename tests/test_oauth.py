@@ -8,6 +8,7 @@
 """
 
 import html
+import secrets
 import sqlite3
 import time
 from pathlib import Path
@@ -82,6 +83,12 @@ def dummy_user(tmp_db):
     import users as _users
     _users.create_user("testuser", "password123")
     return "testuser"
+
+
+def _pkce_pair():
+    verifier = secrets.token_urlsafe(32)
+    challenge = oauth._pkce_challenge_from_verifier(verifier)
+    return verifier, challenge
 
 
 class TestOauthTokenInvalidCode:
@@ -345,8 +352,10 @@ class TestOauthAuthorize:
     def test_redirects_to_login(self, test_client, tmp_db):
         oauth._ensure_tokens_table()
         client = create_oauth_client("app", ["http://localhost/cb"])
+        _, challenge = _pkce_pair()
         r = test_client.get(
-            f"/oauth/authorize?client_id={client['client_id']}&redirect_uri=http://localhost/cb&state=xyz"
+            f"/oauth/authorize?client_id={client['client_id']}&redirect_uri=http://localhost/cb"
+            f"&state=xyz&code_challenge={challenge}&code_challenge_method=S256"
         )
         assert r.status_code in (302, 303, 307)
         assert "/oauth/login" in r.headers["location"]
@@ -354,30 +363,57 @@ class TestOauthAuthorize:
     def test_state_preserved_in_redirect(self, test_client, tmp_db):
         oauth._ensure_tokens_table()
         client = create_oauth_client("app", ["http://localhost/cb"])
+        _, challenge = _pkce_pair()
         r = test_client.get(
             f"/oauth/authorize?state=mystate&redirect_uri=http://localhost/cb&client_id={client['client_id']}"
+            f"&code_challenge={challenge}&code_challenge_method=S256"
         )
         assert "mystate" in r.headers["location"]
 
     def test_rejects_unregistered_redirect_uri(self, test_client, tmp_db):
         oauth._ensure_tokens_table()
         client = create_oauth_client("app", ["http://localhost/cb"])
+        _, challenge = _pkce_pair()
         r = test_client.get(
-            f"/oauth/authorize?client_id={client['client_id']}&redirect_uri=http://evil.example/cb&state=xyz"
+            f"/oauth/authorize?client_id={client['client_id']}&redirect_uri=http://evil.example/cb"
+            f"&state=xyz&code_challenge={challenge}&code_challenge_method=S256"
         )
         assert r.status_code == 400
 
     def test_rejects_unknown_client_id(self, test_client, tmp_db):
         oauth._ensure_tokens_table()
+        _, challenge = _pkce_pair()
         r = test_client.get(
-            "/oauth/authorize?client_id=nonexistent&redirect_uri=http://localhost/cb&state=xyz"
+            f"/oauth/authorize?client_id=nonexistent&redirect_uri=http://localhost/cb"
+            f"&state=xyz&code_challenge={challenge}&code_challenge_method=S256"
         )
         assert r.status_code == 400
 
     def test_allows_empty_redirect_uri(self, test_client, tmp_db):
         oauth._ensure_tokens_table()
-        r = test_client.get("/oauth/authorize?client_id=whatever&redirect_uri=&state=xyz")
+        _, challenge = _pkce_pair()
+        r = test_client.get(
+            f"/oauth/authorize?client_id=whatever&redirect_uri=&state=xyz"
+            f"&code_challenge={challenge}&code_challenge_method=S256"
+        )
         assert r.status_code in (302, 303, 307)
+
+    def test_rejects_missing_code_challenge(self, test_client, tmp_db):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
+        r = test_client.get(
+            f"/oauth/authorize?client_id={client['client_id']}&redirect_uri=http://localhost/cb&state=xyz"
+        )
+        assert r.status_code == 400
+
+    def test_rejects_non_s256_challenge_method(self, test_client, tmp_db):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
+        r = test_client.get(
+            f"/oauth/authorize?client_id={client['client_id']}&redirect_uri=http://localhost/cb"
+            f"&state=xyz&code_challenge=abc&code_challenge_method=plain"
+        )
+        assert r.status_code == 400
 
 
 class TestOauthLoginPost:
@@ -414,9 +450,11 @@ class TestOauthLoginPost:
     def test_success_with_redirect_uri(self, test_client, tmp_db, dummy_user):
         oauth._ensure_tokens_table()
         client = create_oauth_client("app", ["http://localhost/cb"])
+        _, challenge = _pkce_pair()
         with patch("users.log_login_attempt"):
             r = test_client.post(
-                f"/oauth/login?state=mystate&redirect_uri=http://localhost/cb&client_id={client['client_id']}",
+                f"/oauth/login?state=mystate&redirect_uri=http://localhost/cb&client_id={client['client_id']}"
+                f"&code_challenge={challenge}",
                 data={"username": dummy_user, "password": "password123"},
             )
         assert r.status_code in (302, 303)
@@ -427,20 +465,33 @@ class TestOauthLoginPost:
     def test_rejects_unregistered_redirect_uri(self, test_client, tmp_db, dummy_user):
         oauth._ensure_tokens_table()
         client = create_oauth_client("app", ["http://localhost/cb"])
+        _, challenge = _pkce_pair()
         with patch("users.log_login_attempt"):
             r = test_client.post(
-                f"/oauth/login?state=mystate&redirect_uri=http://evil.example/cb&client_id={client['client_id']}",
+                f"/oauth/login?state=mystate&redirect_uri=http://evil.example/cb&client_id={client['client_id']}"
+                f"&code_challenge={challenge}",
                 data={"username": dummy_user, "password": "password123"},
             )
         assert r.status_code == 400
 
     def test_success_without_redirect_shows_html(self, test_client, tmp_db, dummy_user):
+        _, challenge = _pkce_pair()
         with patch("users.log_login_attempt"):
             r = test_client.post(
-                "/oauth/login?state=s&redirect_uri=&client_id=c",
+                f"/oauth/login?state=s&redirect_uri=&client_id=c&code_challenge={challenge}",
                 data={"username": dummy_user, "password": "password123"},
             )
         assert r.status_code in (200, 302, 303)
+
+    def test_rejects_missing_code_challenge(self, test_client, tmp_db, dummy_user):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
+        with patch("users.log_login_attempt"):
+            r = test_client.post(
+                f"/oauth/login?state=mystate&redirect_uri=http://localhost/cb&client_id={client['client_id']}",
+                data={"username": dummy_user, "password": "password123"},
+            )
+        assert r.status_code == 400
 
 
 class TestOauthTokenClientAuth:
@@ -507,6 +558,91 @@ class TestOauthTokenClientAuth:
         }
         r = test_client.post("/oauth/token", data={"code": "code5"})
         assert r.status_code == 200
+
+
+class TestOauthTokenPkce:
+    def test_rejects_missing_code_verifier(self, test_client, tmp_db, dummy_user):
+        _, challenge = _pkce_pair()
+        oauth_codes["pkce1"] = {
+            "redirect_uri": "", "state": "", "username": dummy_user,
+            "issued_at": time.time(), "code_challenge": challenge,
+        }
+        r = test_client.post("/oauth/token", data={"code": "pkce1"})
+        assert r.status_code == 400
+        assert r.json()["error"] == "invalid_grant"
+
+    def test_rejects_wrong_code_verifier(self, test_client, tmp_db, dummy_user):
+        _, challenge = _pkce_pair()
+        oauth_codes["pkce2"] = {
+            "redirect_uri": "", "state": "", "username": dummy_user,
+            "issued_at": time.time(), "code_challenge": challenge,
+        }
+        r = test_client.post("/oauth/token", data={"code": "pkce2", "code_verifier": "not-the-right-verifier"})
+        assert r.status_code == 400
+
+    def test_accepts_correct_code_verifier(self, test_client, tmp_db, dummy_user):
+        verifier, challenge = _pkce_pair()
+        oauth_codes["pkce3"] = {
+            "redirect_uri": "", "state": "", "username": dummy_user,
+            "issued_at": time.time(), "code_challenge": challenge,
+        }
+        r = test_client.post("/oauth/token", data={"code": "pkce3", "code_verifier": verifier})
+        assert r.status_code == 200
+        assert "access_token" in r.json()
+
+    def test_code_without_challenge_needs_no_verifier(self, test_client, tmp_db, dummy_user):
+        oauth_codes["pkce4"] = {
+            "redirect_uri": "", "state": "", "username": dummy_user, "issued_at": time.time(),
+        }
+        r = test_client.post("/oauth/token", data={"code": "pkce4"})
+        assert r.status_code == 200
+
+
+class TestOauthFullFlowWithPkce:
+    def test_authorize_login_token_round_trip(self, test_client, tmp_db, dummy_user):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
+        verifier, challenge = _pkce_pair()
+
+        r = test_client.get(
+            f"/oauth/authorize?client_id={client['client_id']}&redirect_uri=http://localhost/cb"
+            f"&state=xyz&code_challenge={challenge}&code_challenge_method=S256"
+        )
+        assert r.status_code in (302, 303, 307)
+        login_url = r.headers["location"]
+
+        with patch("users.log_login_attempt"):
+            r = test_client.post(login_url, data={"username": dummy_user, "password": "password123"})
+        assert r.status_code in (302, 303)
+        code = r.headers["location"].split("code=")[1].split("&")[0]
+
+        r = test_client.post("/oauth/token", data={
+            "code": code, "client_id": client["client_id"], "client_secret": client["client_secret"],
+            "code_verifier": verifier,
+        })
+        assert r.status_code == 200
+        assert "access_token" in r.json()
+
+    def test_wrong_verifier_fails_the_round_trip(self, test_client, tmp_db, dummy_user):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
+        _, challenge = _pkce_pair()
+
+        r = test_client.get(
+            f"/oauth/authorize?client_id={client['client_id']}&redirect_uri=http://localhost/cb"
+            f"&state=xyz&code_challenge={challenge}&code_challenge_method=S256"
+        )
+        login_url = r.headers["location"]
+
+        with patch("users.log_login_attempt"):
+            r = test_client.post(login_url, data={"username": dummy_user, "password": "password123"})
+        code = r.headers["location"].split("code=")[1].split("&")[0]
+
+        r = test_client.post("/oauth/token", data={
+            "code": code, "client_id": client["client_id"], "client_secret": client["client_secret"],
+            "code_verifier": "some-other-verifier-entirely",
+        })
+        assert r.status_code == 400
 
 
 class TestOauthTokenJsonBody:

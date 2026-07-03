@@ -42,9 +42,9 @@ generated secrets, default users, etc. as yours to secure per-deployment).
   shared storage or move to a real DB before scaling horizontally.
 - Rate limiting (`_check_rate_limit`) is in-memory and per-process, same
   caveat.
-- There's no client-side PKCE enforcement server-side — public clients
-  should still use it, but the server doesn't require `code_challenge`
-  today. Add it if your threat model needs it.
+- Authorization codes live for 60 seconds and are single-use, in-memory
+  only — they don't survive a server restart between `/oauth/authorize`
+  and `/oauth/token`.
 
 ## Supported versions
 

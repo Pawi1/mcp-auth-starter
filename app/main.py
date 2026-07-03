@@ -12,7 +12,6 @@ server.py; everything here is generic.
 
 import contextlib
 import logging
-import re as _re
 import sys
 from collections.abc import AsyncIterator
 
@@ -34,15 +33,6 @@ from server import mcp_server
 from users import _ensure_db_schema
 
 
-class _TokenRedactor(logging.Filter):
-    """Keep bearer tokens passed as a query param out of the log file."""
-    _pat = _re.compile(r'([?&]token=)[^&\s"\']+')
-
-    def filter(self, record):
-        record.msg = self._pat.sub(r'\1[REDACTED]', str(record.msg))
-        return True
-
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
@@ -51,8 +41,6 @@ logging.basicConfig(
         logging.StreamHandler(sys.stderr),
     ],
 )
-for _h in logging.getLogger().handlers:
-    _h.addFilter(_TokenRedactor())
 
 logger = logging.getLogger("mcp-auth-starter")
 
@@ -68,20 +56,17 @@ class _NullResponse:
 async def handle_mcp(request: Request):
     """POST/GET/DELETE /mcp — the actual MCP protocol endpoint.
 
-    Every request must carry a bearer token (query param or Authorization
-    header) that is (a) a validly-signed JWT and (b) still present in the
-    oauth_tokens table (so revocation actually revokes). Both checks matter:
-    a token that only passes (a) but was never issued through OAuth is a
-    forged/stale token, not a legitimate session.
+    Every request must carry a bearer token (Authorization header) that is
+    (a) a validly-signed JWT and (b) still present in the oauth_tokens table
+    (so revocation actually revokes). Both checks matter: a token that only
+    passes (a) but was never issued through OAuth is a forged/stale token,
+    not a legitimate session.
     """
     from auth import verify_token
     from context import current_user
     from oauth import is_token_active
 
-    raw_token = (
-        request.query_params.get("token")
-        or request.headers.get("Authorization", "")[7:]
-    )
+    raw_token = request.headers.get("Authorization", "")[7:]
 
     if not raw_token:
         logger.info(f"MCP {request.method} 401 (no token) from {request.client}")
