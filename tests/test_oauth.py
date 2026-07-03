@@ -691,6 +691,18 @@ class TestOauthTokenPkce:
         r = test_client.post("/oauth/token", data={"code": "pkce2", "code_verifier": "not-the-right-verifier"})
         assert r.status_code == 400
 
+    def test_non_ascii_code_verifier_fails_cleanly(self, test_client, tmp_db, dummy_user):
+        # code_verifier gets .encode("ascii")'d before hashing — a malformed
+        # non-ASCII value must come back as invalid_grant, not a 500
+        _, challenge = _pkce_pair()
+        oauth_codes["pkce6"] = {
+            "redirect_uri": "", "state": "", "username": dummy_user,
+            "issued_at": time.time(), "code_challenge": challenge,
+        }
+        r = test_client.post("/oauth/token", data={"code": "pkce6", "code_verifier": "ü" * 43})
+        assert r.status_code == 400
+        assert r.json()["error"] == "invalid_grant"
+
     def test_accepts_correct_code_verifier(self, test_client, tmp_db, dummy_user):
         verifier, challenge = _pkce_pair()
         oauth_codes["pkce3"] = {

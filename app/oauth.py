@@ -474,7 +474,10 @@ async def oauth_token(request: Request) -> JSONResponse:
             )
 
     if info.get("code_challenge"):
-        if not code_verifier or _pkce_challenge_from_verifier(code_verifier) != info["code_challenge"]:
+        # code_verifier shares code_challenge's RFC 7636 §4.1 charset/length rule —
+        # reject before hashing so a non-ASCII verifier can't raise instead of
+        # cleanly failing PKCE verification
+        if not _code_challenge_valid(code_verifier) or _pkce_challenge_from_verifier(code_verifier) != info["code_challenge"]:
             logger.warning("OAuth token rejected: PKCE verification failed")
             return JSONResponse(
                 {"error": "invalid_grant", "error_description": "PKCE verification failed"},
