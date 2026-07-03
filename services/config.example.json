@@ -1,0 +1,15 @@
+{
+  "paths": {
+    "data_root": "/srv/mcp-auth-starter",
+    "log_dir": "/var/log/mcp-auth-starter"
+  },
+  "server": {
+    "url": "https://mcp.example.com",
+    "name": "mcp-auth-starter",
+    "host": "0.0.0.0",
+    "port": 8000
+  },
+  "auth": {
+    "token_expire_days": 90
+  }
+}

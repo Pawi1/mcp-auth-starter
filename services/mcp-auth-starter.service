@@ -1,0 +1,20 @@
+[Unit]
+Description=MCP Auth Starter
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=mcp
+Group=mcp
+WorkingDirectory=/opt/mcp-auth-starter
+EnvironmentFile=/etc/mcp-auth-starter/mcp-auth-starter.env
+
+ExecStart=/opt/mcp-auth-starter/mcp-auth-starter
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

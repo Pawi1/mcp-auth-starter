@@ -1,0 +1,18 @@
+# Development
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+
+# Secrets / local config
+.env
+.env.local
+config.json
+*.log
+
+# Binary build artifacts
+app/dist/
+app/build/
+app/*.spec

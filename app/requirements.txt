@@ -1,0 +1,13 @@
+# MCP Auth Starter — runtime dependencies
+
+starlette>=1.0.0
+uvicorn[standard]>=0.47.0
+mcp>=1.27.1
+
+python-jose[cryptography]>=3.5.0
+argon2-cffi>=23.1.0
+
+# Testing
+pytest>=8.0.0
+pytest-asyncio>=0.24.0
+httpx>=0.28.0
