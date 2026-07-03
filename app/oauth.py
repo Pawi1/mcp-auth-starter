@@ -311,7 +311,6 @@ async def oauth_clients_register(request: Request) -> JSONResponse:
 
 
 async def oauth_authorize(request: Request) -> Response:
-    from urllib.parse import quote
     redirect_uri = request.query_params.get("redirect_uri", "")
     state = request.query_params.get("state", "")
     client_id = request.query_params.get("client_id", "")
@@ -334,35 +333,36 @@ async def oauth_authorize(request: Request) -> Response:
     # login_id is our own server-side transaction key — state is whatever the
     # client sent (or omitted), just carried through and echoed back to them,
     # never used to look anything up, so two flows sharing a state can't clobber
-    # each other's oauth_pending entry.
+    # each other's oauth_pending entry. Everything the login flow needs lives
+    # only in oauth_pending, keyed by login_id: no restart-survival fallback,
+    # so a server restart mid-login just means starting the flow over.
     login_id = secrets.token_urlsafe(16)
     oauth_pending[login_id] = {
         "redirect_uri": redirect_uri, "client_id": client_id, "state": state,
         "code_challenge": code_challenge,
     }
-    # pass everything in the URL too, so login survives server restarts
-    return RedirectResponse(
-        f"/oauth/login?login_id={login_id}&state={quote(state, safe='')}"
-        f"&redirect_uri={quote(redirect_uri, safe='')}"
-        f"&client_id={quote(client_id, safe='')}&code_challenge={quote(code_challenge, safe='')}"
+    return RedirectResponse(f"/oauth/login?login_id={login_id}")
+
+
+def _expired_login_page() -> HTMLResponse:
+    return HTMLResponse(
+        _page("Sign-in link expired", (
+            "<h2>This sign-in link has expired or is invalid.</h2>"
+            "<p class='sub'>Please retry connecting from your MCP client.</p>"
+        )),
+        status_code=400,
     )
 
 
 async def oauth_login(request: Request) -> Response:
-    from urllib.parse import quote
-    login_id       = request.query_params.get("login_id", "")
-    state          = request.query_params.get("state", "")
-    redirect_uri   = request.query_params.get("redirect_uri", "")
-    client_id      = request.query_params.get("client_id", "")
-    code_challenge = request.query_params.get("code_challenge", "")
-    error          = request.query_params.get("error", "")
-    error_html     = f'<div class="err">{_html.escape(error)}</div>' if error else ""
-    action = (
-        f"/oauth/login?login_id={login_id}&state={quote(state, safe='')}"
-        f"&redirect_uri={quote(redirect_uri, safe='')}"
-        f"&client_id={quote(client_id, safe='')}"
-        f"&code_challenge={quote(code_challenge, safe='')}"
-    )
+    login_id = request.query_params.get("login_id", "")
+    error    = request.query_params.get("error", "")
+
+    if login_id not in oauth_pending:
+        return _expired_login_page()
+
+    error_html = f'<div class="err">{_html.escape(error)}</div>' if error else ""
+    action = f"/oauth/login?login_id={login_id}"
     body = f"""
 <h2>Sign in</h2>
 <p class="sub">Connect your AI assistant to this MCP server</p>
@@ -379,32 +379,25 @@ async def oauth_login(request: Request) -> Response:
 
 
 async def oauth_login_post(request: Request) -> Response:
-    from urllib.parse import quote
     from users import log_login_attempt
-    login_id       = request.query_params.get("login_id", "")
-    state          = request.query_params.get("state", "")
-    redirect_uri   = request.query_params.get("redirect_uri", "")
-    client_id      = request.query_params.get("client_id", "")
-    code_challenge = request.query_params.get("code_challenge", "")
-    ip             = request.client.host if request.client else "unknown"
-    form           = await request.form()
-    username       = str(form.get("username", "")).strip()
-    password       = str(form.get("password", ""))
+    login_id = request.query_params.get("login_id", "")
+    ip       = request.client.host if request.client else "unknown"
+    form     = await request.form()
+    username = str(form.get("username", "")).strip()
+    password = str(form.get("password", ""))
 
-    err_url = (
-        f"/oauth/login?login_id={login_id}&state={quote(state, safe='')}&error=Invalid+username+or+password"
-        f"&redirect_uri={quote(redirect_uri, safe='')}&client_id={quote(client_id, safe='')}"
-        f"&code_challenge={quote(code_challenge, safe='')}"
-    )
+    pending = oauth_pending.get(login_id)
+    if not pending:
+        logger.warning(f"OAuth login rejected: unknown or expired login_id={login_id!r}")
+        return _expired_login_page()
+
+    err_url = f"/oauth/login?login_id={login_id}&error=Invalid+username+or+password"
 
     if not _check_rate_limit(ip):
         logger.warning(f"Rate limit exceeded for IP {ip}")
         log_login_attempt(username, ip, success=False, reason="rate_limit")
         return RedirectResponse(
-            f"/oauth/login?login_id={login_id}&state={quote(state, safe='')}"
-            f"&error=Too+many+attempts.+Wait+a+moment."
-            f"&redirect_uri={quote(redirect_uri, safe='')}&client_id={quote(client_id, safe='')}"
-            f"&code_challenge={quote(code_challenge, safe='')}",
+            f"/oauth/login?login_id={login_id}&error=Too+many+attempts.+Wait+a+moment.",
             status_code=303,
         )
 
@@ -414,25 +407,13 @@ async def oauth_login_post(request: Request) -> Response:
         log_login_attempt(username, ip, success=False, reason="bad_password")
         return RedirectResponse(err_url, status_code=303)
 
-    # prefer in-memory pending, fall back to URL params (survives restarts)
-    pending = oauth_pending.pop(login_id, {})
-    redirect_uri = pending.get("redirect_uri") or redirect_uri
-    client_id = pending.get("client_id") or client_id
-    code_challenge = pending.get("code_challenge") or code_challenge
-    state = pending.get("state", state)
-
-    if not _redirect_uri_valid(client_id, redirect_uri):
-        logger.warning(f"OAuth login rejected: unregistered redirect_uri for client_id={client_id!r}")
-        return JSONResponse(
-            {"error": "invalid_request", "error_description": "redirect_uri is not registered for this client"},
-            status_code=400,
-        )
-    if not _code_challenge_valid(code_challenge):
-        logger.warning(f"OAuth login rejected: missing PKCE code_challenge for client_id={client_id!r}")
-        return JSONResponse(
-            {"error": "invalid_request", "error_description": "code_challenge (S256) is required (PKCE, RFC 7636)"},
-            status_code=400,
-        )
+    # only consume the login transaction once it actually succeeds — a bad
+    # password shouldn't burn it and force the user to restart the flow
+    oauth_pending.pop(login_id, None)
+    redirect_uri = pending["redirect_uri"]
+    client_id = pending["client_id"]
+    code_challenge = pending["code_challenge"]
+    state = pending["state"]
 
     log_login_attempt(username, ip, success=True)
     code = secrets.token_urlsafe(16)

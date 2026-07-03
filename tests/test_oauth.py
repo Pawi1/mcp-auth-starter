@@ -92,6 +92,17 @@ def _pkce_pair():
     return verifier, challenge
 
 
+def _seed_pending(redirect_uri="", client_id="", state="", code_challenge=None):
+    if code_challenge is None:
+        _, code_challenge = _pkce_pair()
+    login_id = secrets.token_urlsafe(16)
+    oauth_pending[login_id] = {
+        "redirect_uri": redirect_uri, "client_id": client_id,
+        "state": state, "code_challenge": code_challenge,
+    }
+    return login_id
+
+
 class TestOauthTokenInvalidCode:
     def test_invalid_code_returns_400(self, test_client):
         r = test_client.post("/oauth/token", data={"code": "totally-fake-code"})
@@ -257,24 +268,33 @@ class TestRateLimit:
 
 class TestOauthLoginXssProtection:
     def test_xss_payload_escaped(self, test_client):
+        login_id = _seed_pending()
         payload = "<script>alert(1)</script>"
-        r = test_client.get(f"/oauth/login?error={payload}&state=x")
+        r = test_client.get(f"/oauth/login?login_id={login_id}&error={payload}")
         assert r.status_code == 200
         body = r.text
         assert "<script>" not in body
         assert html.escape(payload) in body
 
     def test_angle_brackets_escaped(self, test_client):
-        r = test_client.get("/oauth/login?error=<bad>&state=x")
+        login_id = _seed_pending()
+        r = test_client.get(f"/oauth/login?login_id={login_id}&error=<bad>")
         assert "<bad>" not in r.text
 
     def test_normal_error_message_shown(self, test_client):
-        r = test_client.get("/oauth/login?error=Something+went+wrong&state=x")
+        login_id = _seed_pending()
+        r = test_client.get(f"/oauth/login?login_id={login_id}&error=Something+went+wrong")
         assert "Something" in r.text
 
     def test_no_error_param_shows_no_error_div(self, test_client):
-        r = test_client.get("/oauth/login?state=x")
+        login_id = _seed_pending()
+        r = test_client.get(f"/oauth/login?login_id={login_id}")
         assert 'class="err"' not in r.text
+
+    def test_unknown_login_id_shows_expired_page(self, test_client):
+        r = test_client.get("/oauth/login?login_id=nonexistent")
+        assert r.status_code == 400
+        assert "expired" in r.text.lower()
 
 
 class TestOauthClients:
@@ -361,7 +381,9 @@ class TestOauthAuthorize:
         assert r.status_code in (302, 303, 307)
         assert "/oauth/login" in r.headers["location"]
 
-    def test_state_preserved_in_redirect(self, test_client, tmp_db):
+    def test_state_preserved_for_login(self, test_client, tmp_db):
+        # state lives server-side in oauth_pending now, not in the /oauth/login
+        # URL — it's only echoed back to the client in the final redirect
         oauth._ensure_tokens_table()
         client = create_oauth_client("app", ["http://localhost/cb"])
         _, challenge = _pkce_pair()
@@ -369,7 +391,8 @@ class TestOauthAuthorize:
             f"/oauth/authorize?state=mystate&redirect_uri=http://localhost/cb&client_id={client['client_id']}"
             f"&code_challenge={challenge}&code_challenge_method=S256"
         )
-        assert "mystate" in r.headers["location"]
+        login_id = r.headers["location"].split("login_id=")[1].split("&")[0]
+        assert oauth_pending[login_id]["state"] == "mystate"
 
     def test_rejects_unregistered_redirect_uri(self, test_client, tmp_db):
         oauth._ensure_tokens_table()
@@ -463,18 +486,20 @@ class TestOauthAuthorize:
 
 class TestOauthLoginPost:
     def test_bad_password_redirects_with_error(self, test_client, tmp_db, dummy_user):
+        login_id = _seed_pending(redirect_uri="http://localhost/cb", client_id="c")
         with patch("users.log_login_attempt"):
             r = test_client.post(
-                "/oauth/login?state=s&redirect_uri=http://localhost/cb&client_id=c",
+                f"/oauth/login?login_id={login_id}",
                 data={"username": dummy_user, "password": "WRONG"},
             )
         assert r.status_code in (302, 303)
         assert "error" in r.headers["location"].lower()
 
     def test_unknown_user_redirects_with_error(self, test_client, tmp_db):
+        login_id = _seed_pending(redirect_uri="http://localhost/cb", client_id="c")
         with patch("users.log_login_attempt"):
             r = test_client.post(
-                "/oauth/login?state=s&redirect_uri=http://localhost/cb&client_id=c",
+                f"/oauth/login?login_id={login_id}",
                 data={"username": "ghost", "password": "pw"},
             )
         assert r.status_code in (302, 303)
@@ -484,22 +509,20 @@ class TestOauthLoginPost:
         # TestClient sends requests from host "testclient"
         for _ in range(_RATE_LIMIT):
             _record_failed("testclient")
+        login_id = _seed_pending(redirect_uri="http://localhost/cb", client_id="c")
         with patch("users.log_login_attempt"):
             r = test_client.post(
-                "/oauth/login?state=s&redirect_uri=http://localhost/cb&client_id=c",
+                f"/oauth/login?login_id={login_id}",
                 data={"username": dummy_user, "password": "password123"},
             )
         assert r.status_code in (302, 303)
         assert "error" in r.headers["location"].lower()
 
     def test_success_with_redirect_uri(self, test_client, tmp_db, dummy_user):
-        oauth._ensure_tokens_table()
-        client = create_oauth_client("app", ["http://localhost/cb"])
-        _, challenge = _pkce_pair()
+        login_id = _seed_pending(redirect_uri="http://localhost/cb", client_id="c", state="mystate")
         with patch("users.log_login_attempt"):
             r = test_client.post(
-                f"/oauth/login?state=mystate&redirect_uri=http://localhost/cb&client_id={client['client_id']}"
-                f"&code_challenge={challenge}",
+                f"/oauth/login?login_id={login_id}",
                 data={"username": dummy_user, "password": "password123"},
             )
         assert r.status_code in (302, 303)
@@ -507,36 +530,36 @@ class TestOauthLoginPost:
         assert "code=" in loc
         assert "mystate" in loc
 
-    def test_rejects_unregistered_redirect_uri(self, test_client, tmp_db, dummy_user):
-        oauth._ensure_tokens_table()
-        client = create_oauth_client("app", ["http://localhost/cb"])
-        _, challenge = _pkce_pair()
-        with patch("users.log_login_attempt"):
-            r = test_client.post(
-                f"/oauth/login?state=mystate&redirect_uri=http://evil.example/cb&client_id={client['client_id']}"
-                f"&code_challenge={challenge}",
-                data={"username": dummy_user, "password": "password123"},
-            )
-        assert r.status_code == 400
-
     def test_success_without_redirect_shows_html(self, test_client, tmp_db, dummy_user):
-        _, challenge = _pkce_pair()
+        login_id = _seed_pending(redirect_uri="", client_id="c")
         with patch("users.log_login_attempt"):
             r = test_client.post(
-                f"/oauth/login?state=s&redirect_uri=&client_id=c&code_challenge={challenge}",
+                f"/oauth/login?login_id={login_id}",
                 data={"username": dummy_user, "password": "password123"},
             )
         assert r.status_code in (200, 302, 303)
 
-    def test_rejects_missing_code_challenge(self, test_client, tmp_db, dummy_user):
-        oauth._ensure_tokens_table()
-        client = create_oauth_client("app", ["http://localhost/cb"])
+    def test_unknown_login_id_returns_expired_page(self, test_client, tmp_db, dummy_user):
+        r = test_client.post(
+            "/oauth/login?login_id=nonexistent",
+            data={"username": dummy_user, "password": "password123"},
+        )
+        assert r.status_code == 400
+
+    def test_bad_password_does_not_consume_login_id(self, test_client, tmp_db, dummy_user):
+        login_id = _seed_pending(redirect_uri="http://localhost/cb", client_id="c")
         with patch("users.log_login_attempt"):
-            r = test_client.post(
-                f"/oauth/login?state=mystate&redirect_uri=http://localhost/cb&client_id={client['client_id']}",
+            r1 = test_client.post(
+                f"/oauth/login?login_id={login_id}",
+                data={"username": dummy_user, "password": "WRONG"},
+            )
+            assert r1.status_code in (302, 303)
+            r2 = test_client.post(
+                f"/oauth/login?login_id={login_id}",
                 data={"username": dummy_user, "password": "password123"},
             )
-        assert r.status_code == 400
+        assert r2.status_code in (302, 303)
+        assert "code=" in r2.headers["location"]
 
 
 class TestOauthTokenClientAuth:
