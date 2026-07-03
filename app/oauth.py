@@ -25,13 +25,14 @@ logger = logging.getLogger("mcp-auth-starter")
 
 oauth_tokens: dict = {}   # token → {issued_at, username}
 oauth_codes: dict = {}    # code → {redirect_uri, state, username, issued_at, client_id, code_challenge}
-oauth_pending: dict = {}  # login_id → {redirect_uri, client_id, state, code_challenge} — before login
+oauth_pending: dict = {}  # login_id → {redirect_uri, client_id, state, code_challenge, issued_at} — before login
 oauth_clients: dict = {}  # client_id → {client_secret, name, redirect_uris}
 
 _failed_attempts: dict = {}  # ip → [timestamps of failed logins]
 _RATE_LIMIT = 5              # max failed attempts per window
 _RATE_WINDOW = 60            # seconds
 _AUTH_CODE_TTL = 60          # seconds an authorization code stays redeemable
+_LOGIN_TTL = 600             # seconds a pending login transaction (login_id) stays valid
 
 
 def _check_rate_limit(ip: str) -> bool:
@@ -121,6 +122,15 @@ def _pkce_challenge_from_verifier(code_verifier: str) -> str:
     """RFC 7636 §4.2 — S256 transform of a PKCE code_verifier."""
     digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def _get_pending(login_id: str) -> dict | None:
+    """Look up a pending login transaction, evicting it if it's expired."""
+    pending = oauth_pending.get(login_id)
+    if not pending or time.time() - pending["issued_at"] > _LOGIN_TTL:
+        oauth_pending.pop(login_id, None)
+        return None
+    return pending
 
 
 def _parse_basic_auth(header: str) -> tuple:
@@ -339,7 +349,7 @@ async def oauth_authorize(request: Request) -> Response:
     login_id = secrets.token_urlsafe(16)
     oauth_pending[login_id] = {
         "redirect_uri": redirect_uri, "client_id": client_id, "state": state,
-        "code_challenge": code_challenge,
+        "code_challenge": code_challenge, "issued_at": time.time(),
     }
     return RedirectResponse(f"/oauth/login?login_id={login_id}")
 
@@ -358,7 +368,7 @@ async def oauth_login(request: Request) -> Response:
     login_id = request.query_params.get("login_id", "")
     error    = request.query_params.get("error", "")
 
-    if login_id not in oauth_pending:
+    if _get_pending(login_id) is None:
         return _expired_login_page()
 
     error_html = f'<div class="err">{_html.escape(error)}</div>' if error else ""
@@ -386,7 +396,7 @@ async def oauth_login_post(request: Request) -> Response:
     username = str(form.get("username", "")).strip()
     password = str(form.get("password", ""))
 
-    pending = oauth_pending.get(login_id)
+    pending = _get_pending(login_id)
     if not pending:
         logger.warning(f"OAuth login rejected: unknown or expired login_id={login_id!r}")
         return _expired_login_page()

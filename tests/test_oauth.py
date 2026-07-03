@@ -97,13 +97,14 @@ def _pkce_pair():
     return verifier, challenge
 
 
-def _seed_pending(redirect_uri="", client_id="", state="", code_challenge=None):
+def _seed_pending(redirect_uri="", client_id="", state="", code_challenge=None, issued_at=None):
     if code_challenge is None:
         _, code_challenge = _pkce_pair()
     login_id = secrets.token_urlsafe(16)
     oauth_pending[login_id] = {
         "redirect_uri": redirect_uri, "client_id": client_id,
         "state": state, "code_challenge": code_challenge,
+        "issued_at": issued_at if issued_at is not None else time.time(),
     }
     return login_id
 
@@ -306,6 +307,13 @@ class TestOauthLoginXssProtection:
         r = test_client.get("/oauth/login?login_id=nonexistent")
         assert r.status_code == 400
         assert "expired" in r.text.lower()
+
+    def test_stale_login_id_shows_expired_page(self, test_client):
+        login_id = _seed_pending(issued_at=time.time() - oauth._LOGIN_TTL - 1)
+        r = test_client.get(f"/oauth/login?login_id={login_id}")
+        assert r.status_code == 400
+        assert "expired" in r.text.lower()
+        assert login_id not in oauth_pending
 
 
 class TestOauthClients:
@@ -570,6 +578,18 @@ class TestOauthLoginPost:
             data={"username": dummy_user, "password": "password123"},
         )
         assert r.status_code == 400
+
+    def test_stale_login_id_returns_expired_page(self, test_client, tmp_db, dummy_user):
+        login_id = _seed_pending(
+            redirect_uri="http://localhost/cb", client_id="c",
+            issued_at=time.time() - oauth._LOGIN_TTL - 1,
+        )
+        r = test_client.post(
+            f"/oauth/login?login_id={login_id}",
+            data={"username": dummy_user, "password": "password123"},
+        )
+        assert r.status_code == 400
+        assert login_id not in oauth_pending
 
     def test_bad_password_does_not_consume_login_id(self, test_client, tmp_db, dummy_user):
         login_id = _seed_pending(redirect_uri="http://localhost/cb", client_id="c")
