@@ -105,8 +105,14 @@ def _seed_pending(redirect_uri="", client_id="", state="", code_challenge=None, 
         "redirect_uri": redirect_uri, "client_id": client_id,
         "state": state, "code_challenge": code_challenge,
         "issued_at": issued_at if issued_at is not None else time.time(),
+        "csrf_token": secrets.token_urlsafe(24),
     }
     return login_id
+
+
+def _set_login_cookie(test_client, login_id):
+    """Carry the cookie a browser that actually hit /oauth/authorize would have."""
+    test_client.cookies.set(oauth._LOGIN_CSRF_COOKIE, oauth_pending[login_id]["csrf_token"])
 
 
 class TestOauthTokenInvalidCode:
@@ -520,6 +526,7 @@ class TestOauthAuthorize:
 class TestOauthLoginPost:
     def test_bad_password_redirects_with_error(self, test_client, tmp_db, dummy_user):
         login_id = _seed_pending(redirect_uri="http://localhost/cb", client_id="c")
+        _set_login_cookie(test_client, login_id)
         with patch("users.log_login_attempt"):
             r = test_client.post(
                 f"/oauth/login?login_id={login_id}",
@@ -530,6 +537,7 @@ class TestOauthLoginPost:
 
     def test_unknown_user_redirects_with_error(self, test_client, tmp_db):
         login_id = _seed_pending(redirect_uri="http://localhost/cb", client_id="c")
+        _set_login_cookie(test_client, login_id)
         with patch("users.log_login_attempt"):
             r = test_client.post(
                 f"/oauth/login?login_id={login_id}",
@@ -543,6 +551,7 @@ class TestOauthLoginPost:
         for _ in range(_RATE_LIMIT):
             _record_failed("testclient")
         login_id = _seed_pending(redirect_uri="http://localhost/cb", client_id="c")
+        _set_login_cookie(test_client, login_id)
         with patch("users.log_login_attempt"):
             r = test_client.post(
                 f"/oauth/login?login_id={login_id}",
@@ -553,6 +562,7 @@ class TestOauthLoginPost:
 
     def test_success_with_redirect_uri(self, test_client, tmp_db, dummy_user):
         login_id = _seed_pending(redirect_uri="http://localhost/cb", client_id="c", state="mystate")
+        _set_login_cookie(test_client, login_id)
         with patch("users.log_login_attempt"):
             r = test_client.post(
                 f"/oauth/login?login_id={login_id}",
@@ -565,6 +575,7 @@ class TestOauthLoginPost:
 
     def test_success_without_redirect_shows_html(self, test_client, tmp_db, dummy_user):
         login_id = _seed_pending(redirect_uri="", client_id="c")
+        _set_login_cookie(test_client, login_id)
         with patch("users.log_login_attempt"):
             r = test_client.post(
                 f"/oauth/login?login_id={login_id}",
@@ -584,6 +595,7 @@ class TestOauthLoginPost:
             redirect_uri="http://localhost/cb", client_id="c",
             issued_at=time.time() - oauth._LOGIN_TTL - 1,
         )
+        _set_login_cookie(test_client, login_id)
         r = test_client.post(
             f"/oauth/login?login_id={login_id}",
             data={"username": dummy_user, "password": "password123"},
@@ -593,6 +605,7 @@ class TestOauthLoginPost:
 
     def test_bad_password_does_not_consume_login_id(self, test_client, tmp_db, dummy_user):
         login_id = _seed_pending(redirect_uri="http://localhost/cb", client_id="c")
+        _set_login_cookie(test_client, login_id)
         with patch("users.log_login_attempt"):
             r1 = test_client.post(
                 f"/oauth/login?login_id={login_id}",
@@ -606,6 +619,30 @@ class TestOauthLoginPost:
             )
         assert r2.status_code in (302, 303)
         assert "code=" in r2.headers["location"]
+
+    def test_missing_csrf_cookie_rejected(self, test_client, tmp_db, dummy_user):
+        login_id = _seed_pending(redirect_uri="http://localhost/cb", client_id="c")
+        with patch("users.log_login_attempt"):
+            r = test_client.post(
+                f"/oauth/login?login_id={login_id}",
+                data={"username": dummy_user, "password": "password123"},
+            )
+        assert r.status_code == 400
+        assert login_id in oauth_pending
+
+    def test_wrong_csrf_cookie_rejected(self, test_client, tmp_db, dummy_user):
+        # this is the actual attack this cookie closes: someone who never
+        # visited /oauth/authorize themselves (so has a different or no
+        # cookie) can't complete a login_id transaction they didn't start
+        login_id = _seed_pending(redirect_uri="http://localhost/cb", client_id="c")
+        test_client.cookies.set(oauth._LOGIN_CSRF_COOKIE, "someone-elses-cookie")
+        with patch("users.log_login_attempt"):
+            r = test_client.post(
+                f"/oauth/login?login_id={login_id}",
+                data={"username": dummy_user, "password": "password123"},
+            )
+        assert r.status_code == 400
+        assert login_id in oauth_pending
 
 
 class TestOauthTokenClientAuth:

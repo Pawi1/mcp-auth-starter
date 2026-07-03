@@ -25,7 +25,7 @@ logger = logging.getLogger("mcp-auth-starter")
 
 oauth_tokens: dict = {}   # token → {issued_at, username}
 oauth_codes: dict = {}    # code → {redirect_uri, state, username, issued_at, client_id, code_challenge}
-oauth_pending: dict = {}  # login_id → {redirect_uri, client_id, state, code_challenge, issued_at} — before login
+oauth_pending: dict = {}  # login_id → {redirect_uri, client_id, state, code_challenge, issued_at, csrf_token} — before login
 oauth_clients: dict = {}  # client_id → {client_secret, name, redirect_uris}
 
 _failed_attempts: dict = {}  # ip → [timestamps of failed logins]
@@ -33,6 +33,7 @@ _RATE_LIMIT = 5              # max failed attempts per window
 _RATE_WINDOW = 60            # seconds
 _AUTH_CODE_TTL = 60          # seconds an authorization code stays redeemable
 _LOGIN_TTL = 600             # seconds a pending login transaction (login_id) stays valid
+_LOGIN_CSRF_COOKIE = "login_csrf"
 
 
 def _check_rate_limit(ip: str) -> bool:
@@ -352,11 +353,24 @@ async def oauth_authorize(request: Request) -> Response:
     # only in oauth_pending, keyed by login_id: no restart-survival fallback,
     # so a server restart mid-login just means starting the flow over.
     login_id = secrets.token_urlsafe(16)
+    csrf_token = secrets.token_urlsafe(24)
     oauth_pending[login_id] = {
         "redirect_uri": redirect_uri, "client_id": client_id, "state": state,
         "code_challenge": code_challenge, "issued_at": time.time(),
+        "csrf_token": csrf_token,
     }
-    return RedirectResponse(f"/oauth/login?login_id={login_id}")
+    # binds the login transaction to the browser that started it — otherwise
+    # anyone who registers a client (DCR is open) could mint their own
+    # login_id, send the bare /oauth/login link to a victim, and get an
+    # authorization code for the victim's identity redirected to the
+    # attacker's redirect_uri. A browser that never hit /oauth/authorize
+    # itself never has this cookie, so it can't complete someone else's login.
+    response = RedirectResponse(f"/oauth/login?login_id={login_id}")
+    response.set_cookie(
+        _LOGIN_CSRF_COOKIE, csrf_token, max_age=_LOGIN_TTL, path="/oauth/login",
+        httponly=True, samesite="lax", secure=request.url.scheme == "https",
+    )
+    return response
 
 
 def _expired_login_page() -> HTMLResponse:
@@ -404,6 +418,11 @@ async def oauth_login_post(request: Request) -> Response:
     pending = _get_pending(login_id)
     if not pending:
         logger.warning(f"OAuth login rejected: unknown or expired login_id={login_id!r}")
+        return _expired_login_page()
+
+    csrf_cookie = request.cookies.get(_LOGIN_CSRF_COOKIE, "")
+    if not csrf_cookie or not secrets.compare_digest(csrf_cookie, pending["csrf_token"]):
+        logger.warning(f"OAuth login rejected: missing/mismatched CSRF cookie for login_id={login_id!r}")
         return _expired_login_page()
 
     err_url = f"/oauth/login?login_id={login_id}&error=Invalid+username+or+password"
