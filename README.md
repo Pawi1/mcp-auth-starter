@@ -1,5 +1,9 @@
 # MCP Auth Starter
 
+[![Tests](https://github.com/Pawi1/mcp-auth-starter/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/Pawi1/mcp-auth-starter/actions/workflows/tests.yml)
+[![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-blue)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 A minimal, working example of the part of building an MCP server that's
 annoying to get right: **OAuth 2.0 with Dynamic Client Registration (RFC
 7591) + JWT bearer tokens, served over Streamable HTTP** — so Claude.ai (or
