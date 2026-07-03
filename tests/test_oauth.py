@@ -75,6 +75,7 @@ def test_client():
         Route("/oauth/login",              endpoint=oauth.oauth_login_post,         methods=["POST"]),
         Route("/oauth/authorize",          endpoint=oauth.oauth_authorize,          methods=["GET"]),
         Route("/oauth/clients/register",   endpoint=oauth.oauth_clients_register,   methods=["POST"]),
+        Route("/.well-known/oauth-authorization-server", endpoint=oauth.oauth_metadata, methods=["GET"]),
     ])
     return TestClient(app, raise_server_exceptions=True, follow_redirects=False)
 
@@ -373,6 +374,20 @@ class TestOauthClientsRegister:
         r = test_client.post("/oauth/clients/register", content=b"", headers={"Content-Type": "application/json"})
         assert r.status_code == 201
         assert r.json()["client_name"] == "unknown-client"
+
+
+class TestOauthMetadata:
+    def test_does_not_advertise_none_auth_method(self, test_client):
+        # every DCR-registered client gets a client_secret and /oauth/token
+        # requires it — advertising "none" would tell public clients they
+        # can skip auth, which they can't
+        body = test_client.get("/.well-known/oauth-authorization-server").json()
+        assert "none" not in body["token_endpoint_auth_methods_supported"]
+
+    def test_advertises_client_secret_methods(self, test_client):
+        body = test_client.get("/.well-known/oauth-authorization-server").json()
+        assert "client_secret_post" in body["token_endpoint_auth_methods_supported"]
+        assert "client_secret_basic" in body["token_endpoint_auth_methods_supported"]
 
 
 class TestOauthAuthorize:
