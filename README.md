@@ -12,7 +12,7 @@ normal browser login. No manual token pasting, no bypassing OAuth with a
 "just give me a token" shortcut that quietly stops working the moment you
 add real revocation.
 
-This is *not* a framework — it's ~1100 lines of plain Starlette you're meant
+This is *not* a framework — it's ~1200 lines of plain Starlette you're meant
 to read, fork, and build on. There's exactly one demo tool (`whoami`) to
 prove the auth chain works end to end. Your actual tools go in `app/server.py`.
 
@@ -21,8 +21,8 @@ prove the auth chain works end to end. Your actual tools go in `app/server.py`.
 | File | What it does |
 |---|---|
 | `app/main.py` | Starlette app, `/mcp` endpoint + auth gate, lifespan, CLI (`--setup`, `--adduser`) |
-| `app/oauth.py` | Full OAuth 2.0 flow: discovery, Dynamic Client Registration, authorize/login/token, revocation, rate limiting |
-| `app/auth.py` | JWT verification |
+| `app/oauth.py` | Full OAuth 2.0 flow: discovery, Dynamic Client Registration, authorize/login/token (+ refresh grant with rotation), revocation, rate limiting |
+| `app/auth.py` | JWT verification (signature, expiry, audience) |
 | `app/users.py` | User accounts (argon2 password hashing), login attempt logging |
 | `app/context.py` | `ContextVar` carrying the authenticated user into your tool handlers |
 | `app/server.py` | MCP tool definitions — **this is where you add your own tools** |
@@ -36,6 +36,24 @@ a token can have a perfectly valid signature and still not be a real,
 currently-issued session — e.g. after you call `revoke_tokens_for_user()`,
 the JWT itself doesn't change, but it's deleted from the DB, so it correctly
 stops working. Skip the second check and revocation silently does nothing.
+
+## Token lifetimes and audience binding
+
+The access token you send as `Authorization: Bearer` is short-lived (60 min
+default, `auth.access_token_expire_minutes`) — that's the one that ends up
+in logs/proxies, so it's the one worth keeping short-lived. A long-lived,
+opaque `refresh_token` (90 days default, `auth.token_expire_days`, DB-backed
+in `refresh_tokens`, nothing to decode) exchanges for a new pair via
+`grant_type=refresh_token` without the user logging in again. Refresh tokens
+rotate on every use (OAuth 2.1 §4.3.1) — each one is single-use, and using
+one issues a fresh replacement while invalidating the old one, so a copied
+refresh token is only useful until its legitimate owner's next refresh.
+
+The access token also carries an `aud` claim set to this server's canonical
+URI, and `/oauth/authorize`/`/oauth/token` validate an optional `resource`
+parameter (RFC 8707) against it — so a token minted here can't be replayed
+against a different resource server even if it somehow shared your
+`SECRET_KEY`.
 
 ## Quick start
 
@@ -79,7 +97,7 @@ if name == "my_tool":
 make test
 ```
 
-123 tests, ~72% line coverage (`pytest --cov=app`). `app/config.py` and the
+142 tests, ~73% line coverage (`pytest --cov=app`). `app/config.py` and the
 interactive CLI wizard (`--setup`/`--adduser`) are the main gaps — they're
 either constants or `input()`-driven, both low value to unit test.
 

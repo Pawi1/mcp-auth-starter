@@ -10,6 +10,7 @@
     "port": 8000
   },
   "auth": {
-    "token_expire_days": 90
+    "token_expire_days": 90,
+    "access_token_expire_minutes": 60
   }
 }

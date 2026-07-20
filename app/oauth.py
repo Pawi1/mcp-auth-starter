@@ -18,7 +18,10 @@ import time
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-from config import SERVER_URL, DB_PATH, ACCESS_TOKEN_EXPIRE_DAYS
+from config import (
+    SERVER_URL, DB_PATH, REFRESH_TOKEN_EXPIRE_DAYS,
+    ACCESS_TOKEN_EXPIRE_MINUTES, MCP_RESOURCE_URI,
+)
 from users import verify_user
 
 logger = logging.getLogger("mcp-auth-starter")
@@ -62,6 +65,13 @@ def _ensure_tokens_table():
         name TEXT,
         redirect_uris TEXT DEFAULT '[]',
         created_at REAL
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS refresh_tokens (
+        token TEXT PRIMARY KEY,
+        username TEXT,
+        client_id TEXT,
+        issued_at REAL,
+        expires_at REAL
     )""")
     conn.commit()
     conn.close()
@@ -124,6 +134,14 @@ def _code_verifier_valid(code_verifier: str) -> bool:
     return _code_challenge_valid(code_verifier)
 
 
+def _resource_valid(resource: str) -> bool:
+    """RFC 8707 — if a client specifies a target resource, it must be this server's
+    canonical URI. Absent is allowed (not every client sends it), but a mismatched
+    one is rejected outright rather than silently issuing a token for the wrong resource.
+    """
+    return not resource or resource.rstrip("/") == MCP_RESOURCE_URI.rstrip("/")
+
+
 def _pkce_challenge_from_verifier(code_verifier: str) -> str:
     """RFC 7636 §4.2 — S256 transform of a PKCE code_verifier."""
     digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
@@ -152,7 +170,8 @@ def _parse_basic_auth(header: str) -> tuple:
 
 
 def issue_token(username: str) -> str:
-    """Issue a JWT access token (so verify_token can validate it from Authorization header)."""
+    """Issue a short-lived JWT access token (so verify_token can validate it from
+    Authorization header). Audience-bound to MCP_RESOURCE_URI — see auth.verify_token."""
     from jose import jwt as jose_jwt
     from config import SECRET_KEY, ALGORITHM
     from users import get_user
@@ -161,9 +180,9 @@ def issue_token(username: str) -> str:
     teams = json.loads(user.get("teams", "[]")) if user else []
 
     now = time.time()
-    expires = now + 86400 * ACCESS_TOKEN_EXPIRE_DAYS
+    expires = now + 60 * ACCESS_TOKEN_EXPIRE_MINUTES
     token = jose_jwt.encode(
-        {"sub": username, "teams": teams, "exp": int(expires)},
+        {"sub": username, "teams": teams, "aud": MCP_RESOURCE_URI, "exp": int(expires)},
         SECRET_KEY, algorithm=ALGORITHM,
     )
 
@@ -179,6 +198,45 @@ def issue_token(username: str) -> str:
     # codeql[py/clear-text-logging-sensitive-data]
     logger.info(f"Token issued for user: {username}")
     return token
+
+
+def issue_refresh_token(username: str, client_id: str = "") -> str:
+    """Issue a long-lived, opaque refresh token (DB-backed, not a JWT — nothing to decode)."""
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    expires = now + 86400 * REFRESH_TOKEN_EXPIRE_DAYS
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.execute("INSERT OR REPLACE INTO refresh_tokens VALUES (?,?,?,?,?)",
+                     (token, username, client_id, now, expires))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"Refresh token DB save failed: {e}")
+    return token
+
+
+def redeem_refresh_token(token: str, client_id: str) -> str | None:
+    """Validate a refresh token and consume it (OAuth 2.1 §4.3.1 rotation — one-time
+    use, the caller mints a fresh replacement). Returns the username, or None if the
+    token is unknown, expired, or was issued to a different client_id."""
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT username, client_id, expires_at FROM refresh_tokens WHERE token=?", (token,)
+        ).fetchone()
+        if not row or row["expires_at"] < time.time() or row["client_id"] != client_id:
+            conn.close()
+            return None
+        username = row["username"]
+        conn.execute("DELETE FROM refresh_tokens WHERE token=?", (token,))
+        conn.commit()
+        conn.close()
+        return username
+    except Exception as e:
+        logger.warning(f"Refresh token validation error: {e}")
+        return None
 
 
 def load_tokens_from_db():
@@ -231,12 +289,13 @@ def cleanup_expired_tokens() -> int:
     """Remove expired tokens from DB and in-memory cache. Returns number removed."""
     now = time.time()
     expired = [t for t, info in list(oauth_tokens.items())
-               if now - info["issued_at"] >= 86400 * ACCESS_TOKEN_EXPIRE_DAYS]
+               if now - info["issued_at"] >= 60 * ACCESS_TOKEN_EXPIRE_MINUTES]
     for t in expired:
         oauth_tokens.pop(t, None)
     try:
         conn = sqlite3.connect(str(DB_PATH))
         conn.execute("DELETE FROM oauth_tokens WHERE expires_at < ?", (now,))
+        conn.execute("DELETE FROM refresh_tokens WHERE expires_at < ?", (now,))
         conn.commit()
         conn.close()
     except Exception as e:
@@ -275,7 +334,7 @@ def _page(title: str, body: str) -> str:
 async def oauth_protected_resource(request: Request) -> JSONResponse:
     """RFC 8707 — tells clients where the authorization server is"""
     return JSONResponse({
-        "resource": f"{SERVER_URL}/mcp",
+        "resource": MCP_RESOURCE_URI,
         "authorization_servers": [SERVER_URL],
     })
 
@@ -287,7 +346,7 @@ async def oauth_metadata(request: Request) -> JSONResponse:
         "token_endpoint": f"{SERVER_URL}/oauth/token",
         "registration_endpoint": f"{SERVER_URL}/oauth/clients/register",
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
         "scopes_supported": ["mcp"],
@@ -319,7 +378,7 @@ async def oauth_clients_register(request: Request) -> JSONResponse:
         "client_secret_expires_at": 0,
         "client_name": name,
         "redirect_uris": redirect_uris,
-        "grant_types": ["authorization_code"],
+        "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
         "token_endpoint_auth_method": "client_secret_post",
         "scope": "mcp",
@@ -332,6 +391,7 @@ async def oauth_authorize(request: Request) -> Response:
     client_id = request.query_params.get("client_id", "")
     code_challenge = request.query_params.get("code_challenge", "")
     code_challenge_method = request.query_params.get("code_challenge_method", "S256")
+    resource = request.query_params.get("resource", "")
 
     if not _redirect_uri_valid(client_id, redirect_uri):
         logger.warning(f"OAuth authorize rejected: unregistered redirect_uri for client_id={client_id!r}")
@@ -343,6 +403,12 @@ async def oauth_authorize(request: Request) -> Response:
         logger.warning(f"OAuth authorize rejected: missing/unsupported PKCE for client_id={client_id!r}")
         return JSONResponse(
             {"error": "invalid_request", "error_description": "code_challenge (S256) is required (PKCE, RFC 7636)"},
+            status_code=400,
+        )
+    if not _resource_valid(resource):
+        logger.warning(f"OAuth authorize rejected: resource {resource!r} does not match this server")
+        return JSONResponse(
+            {"error": "invalid_target", "error_description": f"resource must be {MCP_RESOURCE_URI}"},
             status_code=400,
         )
 
@@ -481,21 +547,65 @@ async def oauth_login_post(request: Request) -> Response:
 async def oauth_token(request: Request) -> JSONResponse:
     try:
         form = await request.form()
+        grant_type = str(form.get("grant_type", "authorization_code"))
         code = str(form.get("code", ""))
         client_id = str(form.get("client_id", ""))
         client_secret = str(form.get("client_secret", ""))
         code_verifier = str(form.get("code_verifier", ""))
+        refresh_token_in = str(form.get("refresh_token", ""))
+        resource = str(form.get("resource", ""))
     except Exception:
         body = await request.body()
         data = json.loads(body) if body else {}
+        grant_type = data.get("grant_type", "authorization_code")
         code = data.get("code", "")
         client_id = data.get("client_id", "")
         client_secret = data.get("client_secret", "")
         code_verifier = data.get("code_verifier", "")
+        refresh_token_in = data.get("refresh_token", "")
+        resource = data.get("resource", "")
 
     if not client_id:
         # client_secret_basic (RFC 6749 §2.3.1) instead of client_secret_post
         client_id, client_secret = _parse_basic_auth(request.headers.get("authorization", ""))
+
+    if not _resource_valid(resource):
+        logger.warning(f"OAuth token rejected: resource {resource!r} does not match this server")
+        return JSONResponse(
+            {"error": "invalid_target", "error_description": f"resource must be {MCP_RESOURCE_URI}"},
+            status_code=400,
+        )
+
+    if grant_type == "refresh_token":
+        if not refresh_token_in:
+            return JSONResponse(
+                {"error": "invalid_request", "error_description": "Missing refresh_token"},
+                status_code=400,
+            )
+        client = oauth_clients.get(client_id)
+        if not client or not secrets.compare_digest(client_secret, client["client_secret"]):
+            logger.warning(f"OAuth refresh rejected: client authentication failed for client_id={client_id!r}")
+            return JSONResponse(
+                {"error": "invalid_client", "error_description": "Client authentication failed"},
+                status_code=401,
+            )
+        # one-time use (OAuth 2.1 §4.3.1 rotation) — a reused/expired/unknown
+        # refresh_token, or one issued to a different client, all come back None
+        username = redeem_refresh_token(refresh_token_in, client_id)
+        if not username:
+            logger.warning("OAuth refresh rejected: invalid, expired, or already-used refresh_token")
+            return JSONResponse(
+                {"error": "invalid_grant", "error_description": "Invalid or expired refresh_token"},
+                status_code=400,
+            )
+        logger.info(f"Access token refreshed for user: {username}")
+        return JSONResponse({
+            "access_token": issue_token(username),
+            "refresh_token": issue_refresh_token(username, client_id),
+            "token_type": "bearer",
+            "expires_in": int(60 * ACCESS_TOKEN_EXPIRE_MINUTES),
+            "scope": "mcp",
+        })
 
     # peek, don't consume yet — a wrong client_secret or code_verifier
     # shouldn't burn a code that's still legitimately redeemable within its TTL
@@ -534,9 +644,11 @@ async def oauth_token(request: Request) -> JSONResponse:
 
     oauth_codes.pop(code, None)
     token = issue_token(info["username"])
+    refresh_token_out = issue_refresh_token(info["username"], client_id)
     return JSONResponse({
         "access_token": token,
+        "refresh_token": refresh_token_out,
         "token_type": "bearer",
-        "expires_in": int(86400 * ACCESS_TOKEN_EXPIRE_DAYS),
+        "expires_in": int(60 * ACCESS_TOKEN_EXPIRE_MINUTES),
         "scope": "mcp",
     })

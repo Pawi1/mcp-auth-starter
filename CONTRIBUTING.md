@@ -9,7 +9,7 @@ make test    # runs the test suite
 
 ## Before opening a PR
 
-- `make test` passes (123 tests today — add tests for whatever you change,
+- `make test` passes (142 tests today — add tests for whatever you change,
   especially anything in `app/auth.py`/`app/oauth.py`/`app/main.py`'s
   `/mcp` handler; see [SECURITY.md](SECURITY.md) for why those files get
   extra scrutiny).

@@ -7,7 +7,7 @@ from typing import Dict
 
 from jose import jwt, JWTError
 
-from config import SECRET_KEY, ALGORITHM
+from config import SECRET_KEY, ALGORITHM, MCP_RESOURCE_URI
 
 logger = logging.getLogger("mcp-auth-starter")
 
@@ -27,7 +27,11 @@ async def verify_token(token: str) -> Dict:
     Raises: ValueError if token invalid
     """
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        # audience=MCP_RESOURCE_URI (RFC 8707): tokens carrying an "aud" claim
+        # must match this server's canonical resource URI or are rejected —
+        # tokens with no "aud" at all (pre-existing ones, issued before this
+        # check existed) are left unvalidated on this claim, not rejected.
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM], audience=MCP_RESOURCE_URI)
         username = payload.get("sub")
         teams = payload.get("teams", [])
 

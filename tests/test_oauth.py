@@ -29,6 +29,7 @@ from oauth import (
     cleanup_expired_tokens,
     create_oauth_client,
     is_token_active,
+    issue_refresh_token,
     issue_token,
     load_clients_from_db,
     load_tokens_from_db,
@@ -36,6 +37,7 @@ from oauth import (
     oauth_codes,
     oauth_pending,
     oauth_tokens,
+    redeem_refresh_token,
     revoke_tokens_for_user,
 )
 
@@ -50,6 +52,9 @@ def tmp_db(tmp_path, monkeypatch):
     conn = sqlite3.connect(str(db_path))
     conn.execute("""CREATE TABLE IF NOT EXISTS oauth_tokens (
         token TEXT PRIMARY KEY, username TEXT, issued_at REAL, expires_at REAL
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS refresh_tokens (
+        token TEXT PRIMARY KEY, username TEXT, client_id TEXT, issued_at REAL, expires_at REAL
     )""")
     conn.commit()
     conn.close()
@@ -144,10 +149,15 @@ class TestOauthTokenInvalidCode:
         assert body["token_type"] == "bearer"
 
     def test_expires_in_matches_configured_token_lifetime(self, test_client, tmp_db, dummy_user):
-        from config import ACCESS_TOKEN_EXPIRE_DAYS
+        from config import ACCESS_TOKEN_EXPIRE_MINUTES
         oauth_codes["ttl-code"] = {"redirect_uri": "", "state": "", "username": dummy_user, "issued_at": time.time()}
         r = test_client.post("/oauth/token", data={"code": "ttl-code"})
-        assert r.json()["expires_in"] == 86400 * ACCESS_TOKEN_EXPIRE_DAYS
+        assert r.json()["expires_in"] == 60 * ACCESS_TOKEN_EXPIRE_MINUTES
+
+    def test_issues_a_refresh_token_alongside_the_access_token(self, test_client, tmp_db, dummy_user):
+        oauth_codes["rt-code"] = {"redirect_uri": "", "state": "", "username": dummy_user, "issued_at": time.time()}
+        r = test_client.post("/oauth/token", data={"code": "rt-code"})
+        assert r.json()["refresh_token"]
 
     def test_expired_code_returns_400(self, test_client, tmp_db, dummy_user):
         oauth_codes["stale-code"] = {
@@ -226,7 +236,7 @@ class TestRevokeTokensForUser:
 
 class TestCleanupExpiredTokens:
     def test_removes_expired_from_memory(self, tmp_db, dummy_user, monkeypatch):
-        monkeypatch.setattr("oauth.ACCESS_TOKEN_EXPIRE_DAYS", 0)
+        monkeypatch.setattr("oauth.ACCESS_TOKEN_EXPIRE_MINUTES", 0)
         token = issue_token(dummy_user)
         oauth_tokens[token]["issued_at"] = time.time() - 1
         cleanup_expired_tokens()
@@ -434,6 +444,10 @@ class TestOauthMetadata:
         assert "client_secret_post" in body["token_endpoint_auth_methods_supported"]
         assert "client_secret_basic" in body["token_endpoint_auth_methods_supported"]
 
+    def test_advertises_refresh_token_grant(self, test_client):
+        body = test_client.get("/.well-known/oauth-authorization-server").json()
+        assert "refresh_token" in body["grant_types_supported"]
+
 
 class TestOauthAuthorize:
     def test_redirects_to_login(self, test_client, tmp_db):
@@ -522,6 +536,40 @@ class TestOauthAuthorize:
             "state": "xyz", "code_challenge": "!" * 43, "code_challenge_method": "S256",
         })
         assert r.status_code == 400
+
+    def test_rejects_mismatched_resource(self, test_client, tmp_db):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
+        _, challenge = _pkce_pair()
+        r = test_client.get(
+            f"/oauth/authorize?client_id={client['client_id']}&redirect_uri=http://localhost/cb"
+            f"&state=xyz&code_challenge={challenge}&code_challenge_method=S256"
+            f"&resource=https://someone-elses-mcp-server.example/mcp"
+        )
+        assert r.status_code == 400
+        assert r.json()["error"] == "invalid_target"
+
+    def test_allows_matching_resource(self, test_client, tmp_db):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
+        _, challenge = _pkce_pair()
+        r = test_client.get(
+            f"/oauth/authorize?client_id={client['client_id']}&redirect_uri=http://localhost/cb"
+            f"&state=xyz&code_challenge={challenge}&code_challenge_method=S256"
+            f"&resource=http://localhost:8000/mcp"
+        )
+        assert r.status_code in (302, 303, 307)
+
+    def test_allows_omitted_resource(self, test_client, tmp_db):
+        # not every client sends `resource` — absence must not be rejected outright
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
+        _, challenge = _pkce_pair()
+        r = test_client.get(
+            f"/oauth/authorize?client_id={client['client_id']}&redirect_uri=http://localhost/cb"
+            f"&state=xyz&code_challenge={challenge}&code_challenge_method=S256"
+        )
+        assert r.status_code in (302, 303, 307)
 
     def test_two_flows_with_the_same_client_state_do_not_clobber_each_other(self, test_client, tmp_db):
         # state is client-controlled and echoed back verbatim, never used as a
@@ -825,6 +873,150 @@ class TestOauthTokenPkce:
         assert "pkce5" in oauth_codes
         r2 = test_client.post("/oauth/token", data={"code": "pkce5", "code_verifier": verifier})
         assert r2.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# oauth_token — resource parameter (RFC 8707 audience binding)
+# ---------------------------------------------------------------------------
+
+class TestOauthTokenResourceParameter:
+    def test_rejects_mismatched_resource(self, test_client, tmp_db, dummy_user):
+        oauth_codes["res-bad"] = {"redirect_uri": "", "state": "", "username": dummy_user, "issued_at": time.time()}
+        r = test_client.post("/oauth/token", data={
+            "code": "res-bad", "resource": "https://someone-elses-mcp-server.example/mcp",
+        })
+        assert r.status_code == 400
+        assert r.json()["error"] == "invalid_target"
+        # a mismatched resource must not consume the code either
+        assert "res-bad" in oauth_codes
+
+    def test_allows_matching_resource(self, test_client, tmp_db, dummy_user):
+        oauth_codes["res-ok"] = {"redirect_uri": "", "state": "", "username": dummy_user, "issued_at": time.time()}
+        r = test_client.post("/oauth/token", data={
+            "code": "res-ok", "resource": "http://localhost:8000/mcp",
+        })
+        assert r.status_code == 200
+
+    def test_allows_omitted_resource(self, test_client, tmp_db, dummy_user):
+        oauth_codes["res-omit"] = {"redirect_uri": "", "state": "", "username": dummy_user, "issued_at": time.time()}
+        r = test_client.post("/oauth/token", data={"code": "res-omit"})
+        assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# oauth_token — refresh_token grant (rotation, RFC 6749 + OAuth 2.1 §4.3.1)
+# ---------------------------------------------------------------------------
+
+class TestOauthTokenRefreshGrant:
+    def test_refresh_grant_issues_new_access_and_refresh_token(self, test_client, tmp_db, dummy_user):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
+        refresh = issue_refresh_token(dummy_user, client["client_id"])
+
+        r = test_client.post("/oauth/token", data={
+            "grant_type": "refresh_token", "refresh_token": refresh,
+            "client_id": client["client_id"], "client_secret": client["client_secret"],
+        })
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["access_token"]
+        assert body["refresh_token"]
+        assert body["refresh_token"] != refresh
+
+    def test_refresh_token_is_one_time_use(self, test_client, tmp_db, dummy_user):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
+        refresh = issue_refresh_token(dummy_user, client["client_id"])
+        data = {
+            "grant_type": "refresh_token", "refresh_token": refresh,
+            "client_id": client["client_id"], "client_secret": client["client_secret"],
+        }
+
+        r1 = test_client.post("/oauth/token", data=data)
+        assert r1.status_code == 200
+        r2 = test_client.post("/oauth/token", data=data)
+        assert r2.status_code == 400
+        assert r2.json()["error"] == "invalid_grant"
+
+    def test_rejects_unknown_refresh_token(self, test_client, tmp_db):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
+        r = test_client.post("/oauth/token", data={
+            "grant_type": "refresh_token", "refresh_token": "totally-made-up",
+            "client_id": client["client_id"], "client_secret": client["client_secret"],
+        })
+        assert r.status_code == 400
+        assert r.json()["error"] == "invalid_grant"
+
+    def test_rejects_expired_refresh_token(self, test_client, tmp_db, dummy_user):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
+        refresh = issue_refresh_token(dummy_user, client["client_id"])
+        conn = sqlite3.connect(str(tmp_db))
+        conn.execute("UPDATE refresh_tokens SET expires_at=? WHERE token=?", (time.time() - 1, refresh))
+        conn.commit()
+        conn.close()
+
+        r = test_client.post("/oauth/token", data={
+            "grant_type": "refresh_token", "refresh_token": refresh,
+            "client_id": client["client_id"], "client_secret": client["client_secret"],
+        })
+        assert r.status_code == 400
+
+    def test_rejects_wrong_client_secret(self, test_client, tmp_db, dummy_user):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
+        refresh = issue_refresh_token(dummy_user, client["client_id"])
+        r = test_client.post("/oauth/token", data={
+            "grant_type": "refresh_token", "refresh_token": refresh,
+            "client_id": client["client_id"], "client_secret": "wrong",
+        })
+        assert r.status_code == 401
+        assert r.json()["error"] == "invalid_client"
+
+    def test_rejects_refresh_token_redeemed_by_a_different_client(self, test_client, tmp_db, dummy_user):
+        # a refresh token leaked from client A must not be usable by client B,
+        # even with B's own valid credentials
+        oauth._ensure_tokens_table()
+        owner = create_oauth_client("owner-app", ["http://localhost/cb"])
+        attacker = create_oauth_client("attacker-app", ["http://evil.example/cb"])
+        refresh = issue_refresh_token(dummy_user, owner["client_id"])
+
+        r = test_client.post("/oauth/token", data={
+            "grant_type": "refresh_token", "refresh_token": refresh,
+            "client_id": attacker["client_id"], "client_secret": attacker["client_secret"],
+        })
+        assert r.status_code == 400
+        assert r.json()["error"] == "invalid_grant"
+
+    def test_rejects_missing_refresh_token(self, test_client, tmp_db):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
+        r = test_client.post("/oauth/token", data={
+            "grant_type": "refresh_token",
+            "client_id": client["client_id"], "client_secret": client["client_secret"],
+        })
+        assert r.status_code == 400
+        assert r.json()["error"] == "invalid_request"
+
+    def test_new_access_token_passes_verify_token(self, test_client, tmp_db, dummy_user):
+        # regression guard: the refreshed access_token must carry the same
+        # aud claim as any normally-issued token, or auth.verify_token would
+        # reject every token minted via this path
+        from auth import verify_token as _verify
+
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("app", ["http://localhost/cb"])
+        refresh = issue_refresh_token(dummy_user, client["client_id"])
+        r = test_client.post("/oauth/token", data={
+            "grant_type": "refresh_token", "refresh_token": refresh,
+            "client_id": client["client_id"], "client_secret": client["client_secret"],
+        })
+        access_token = r.json()["access_token"]
+        import asyncio
+        user = asyncio.run(_verify(access_token))
+        assert user["username"] == dummy_user
 
 
 class TestOauthFullFlowWithPkce:

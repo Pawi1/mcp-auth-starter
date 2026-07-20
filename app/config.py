@@ -51,7 +51,16 @@ MCP_HOST           = os.getenv("MCP_HOST", _p("server.host", "0.0.0.0"))
 MCP_PORT           = int(os.getenv("MCP_PORT", str(_p("server.port", 8000))))
 
 # Auth
-ACCESS_TOKEN_EXPIRE_DAYS = int(_p("auth.token_expire_days", 90))
+# token_expire_days now governs the long-lived refresh_token; the bearer access
+# token sent on every MCP request is short-lived (access_token_expire_minutes)
+# so a leaked one has a small blast radius — the MCP client refreshes silently.
+REFRESH_TOKEN_EXPIRE_DAYS   = int(_p("auth.token_expire_days", 90))
+ACCESS_TOKEN_EXPIRE_MINUTES = int(_p("auth.access_token_expire_minutes", 60))
+
+# Canonical resource URI for this MCP server — RFC 8707 / RFC 9728 audience
+# binding, so a token issued here can't be replayed against a different
+# resource server even if it shared the same signing key.
+MCP_RESOURCE_URI = f"{SERVER_URL.rstrip('/')}/mcp"
 
 # Setup state — used by startup checks to detect missing config
 CONFIG_PATH  = _cfg_path
