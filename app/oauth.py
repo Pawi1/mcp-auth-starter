@@ -195,7 +195,7 @@ def issue_token(username: str) -> str:
         conn.close()
     except Exception as e:
         logger.warning(f"Token DB save failed: {e}")
-    logger.info(f"Token issued for user: {username}")  # codeql[py/clear-text-logging-sensitive-data]
+    logger.info("Token issued")
     return token
 
 
