@@ -787,7 +787,9 @@ class TestOauthAuthorizeCimd:
         )
         login_id = r.headers["location"].split("login_id=")[1].split("&")[0]
         page = test_client.get(f"/oauth/login?login_id={login_id}")
-        assert "app.example.com" in page.text
+        # asserting the exact rendered fragment (not a bare hostname substring
+        # check) so this doesn't read like a URL-allowlist check on page.text
+        assert "<code>app.example.com</code>" in page.text
 
     def test_consent_page_for_dcr_client_has_no_host_line(self, test_client, tmp_db):
         # opaque DCR client_ids aren't URLs, so there's no hostname to show
