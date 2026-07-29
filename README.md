@@ -5,6 +5,7 @@
 > `@server.list_tools()`/`@server.call_tool()` decorators). If you need the
 > mcp 1.x-pinned version, check out the
 > [`legacy`](https://github.com/Pawi1/mcp-auth-starter/tree/legacy) branch.
+> Migrating your own fork? See [MIGRATING.md](MIGRATING.md).
 
 [![Tests](https://github.com/Pawi1/mcp-auth-starter/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/Pawi1/mcp-auth-starter/actions/workflows/tests.yml)
 [![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-blue)](https://www.python.org/downloads/)
