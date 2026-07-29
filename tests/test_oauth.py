@@ -393,6 +393,45 @@ class TestOauthClients:
         load_clients_from_db()  # must not raise
         assert oauth_clients == {}
 
+    def test_application_type_defaults_to_web(self, tmp_db):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("test-app")
+        assert client["application_type"] == "web"
+        assert oauth_clients[client["client_id"]]["application_type"] == "web"
+
+    def test_application_type_native_is_stored(self, tmp_db):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("cli-app", application_type="native")
+        assert client["application_type"] == "native"
+        assert oauth_clients[client["client_id"]]["application_type"] == "native"
+
+    def test_unknown_application_type_falls_back_to_web(self, tmp_db):
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("weird-app", application_type="mobile")
+        assert client["application_type"] == "web"
+
+    def test_load_clients_from_db_restores_application_type(self, tmp_db):
+        oauth._ensure_tokens_table()
+        oauth_clients.clear()
+        created = create_oauth_client("native-app", application_type="native")
+        oauth_clients.clear()
+        load_clients_from_db()
+        assert oauth_clients[created["client_id"]]["application_type"] == "native"
+
+    def test_migrates_pre_existing_db_missing_the_column(self, tmp_db):
+        # simulates a DB created before application_type existed (SEP-837) —
+        # _ensure_tokens_table's ALTER TABLE must backfill it without raising
+        conn = sqlite3.connect(str(tmp_db))
+        conn.execute("""CREATE TABLE oauth_clients (
+            client_id TEXT PRIMARY KEY, client_secret TEXT NOT NULL,
+            name TEXT, redirect_uris TEXT DEFAULT '[]', created_at REAL
+        )""")
+        conn.commit()
+        conn.close()
+        oauth._ensure_tokens_table()  # must not raise
+        client = create_oauth_client("post-migration-app")
+        assert client["application_type"] == "web"
+
 
 class TestLoadTokensFromDb:
     def test_loads_valid_token(self, tmp_db, dummy_user):
@@ -435,6 +474,41 @@ class TestOauthClientsRegister:
         r = test_client.post("/oauth/clients/register", content=b"", headers={"Content-Type": "application/json"})
         assert r.status_code == 201
         assert r.json()["client_name"] == "unknown-client"
+
+    def test_defaults_application_type_to_web(self, test_client, tmp_db):
+        oauth._ensure_tokens_table()
+        r = test_client.post(
+            "/oauth/clients/register",
+            json={"client_name": "my-app", "redirect_uris": ["http://localhost/cb"]},
+        )
+        assert r.json()["application_type"] == "web"
+
+    def test_echoes_native_application_type(self, test_client, tmp_db):
+        oauth._ensure_tokens_table()
+        r = test_client.post(
+            "/oauth/clients/register",
+            json={
+                "client_name": "cli-app", "application_type": "native",
+                "redirect_uris": ["http://localhost:8765/cb"],
+            },
+        )
+        assert r.status_code == 201
+        assert r.json()["application_type"] == "native"
+
+    def test_does_not_reject_web_client_with_localhost_redirect(self, test_client, tmp_db):
+        # SEP-837 lets a client declare application_type so a real OIDC AS
+        # doesn't wrongly default it to "web" and reject a localhost
+        # redirect_uri — but this server isn't an OIDC AS and never enforced
+        # that constraint, so a "web" app registering localhost still works
+        oauth._ensure_tokens_table()
+        r = test_client.post(
+            "/oauth/clients/register",
+            json={
+                "client_name": "web-app-with-localhost", "application_type": "web",
+                "redirect_uris": ["http://localhost:3000/cb"],
+            },
+        )
+        assert r.status_code == 201
 
 
 class TestOauthMetadata:

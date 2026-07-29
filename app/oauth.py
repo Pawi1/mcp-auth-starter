@@ -76,8 +76,14 @@ def _ensure_tokens_table():
         client_secret TEXT NOT NULL,
         name TEXT,
         redirect_uris TEXT DEFAULT '[]',
+        application_type TEXT DEFAULT 'web',
         created_at REAL
     )""")
+    try:
+        # migrate DBs created before application_type existed (SEP-837)
+        conn.execute("ALTER TABLE oauth_clients ADD COLUMN application_type TEXT DEFAULT 'web'")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     conn.execute("""CREATE TABLE IF NOT EXISTS refresh_tokens (
         token TEXT PRIMARY KEY,
         username TEXT,
@@ -92,32 +98,44 @@ def _ensure_tokens_table():
 def load_clients_from_db():
     try:
         conn = sqlite3.connect(str(DB_PATH))
-        rows = conn.execute("SELECT client_id, client_secret, name, redirect_uris FROM oauth_clients").fetchall()
+        rows = conn.execute(
+            "SELECT client_id, client_secret, name, redirect_uris, application_type FROM oauth_clients"
+        ).fetchall()
         conn.close()
-        for client_id, client_secret, name, redirect_uris in rows:
+        for client_id, client_secret, name, redirect_uris, application_type in rows:
             oauth_clients[client_id] = {
                 "client_secret": client_secret,
                 "name": name,
                 "redirect_uris": json.loads(redirect_uris or "[]"),
+                "application_type": application_type or "web",
             }
         logger.info(f"Loaded {len(rows)} OAuth client(s) from DB")
     except Exception as e:
         logger.warning(f"OAuth clients DB load failed: {e}")
 
 
-def create_oauth_client(name: str, redirect_uris: list = None) -> dict:
+def create_oauth_client(name: str, redirect_uris: list = None, application_type: str = "web") -> dict:
+    """application_type is OIDC Dynamic Client Registration's native-vs-web hint
+    (SEP-837) — this server isn't an OIDC provider and doesn't enforce any
+    redirect_uri constraints from it, just stores and echoes it back so MCP
+    clients that send it (as the spec now requires) get a clean registration
+    instead of the field being silently dropped."""
+    application_type = "native" if application_type == "native" else "web"
     client_id = secrets.token_urlsafe(16)
     client_secret = secrets.token_urlsafe(32)
     now = time.time()
     uris = redirect_uris or []
     conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("INSERT INTO oauth_clients VALUES (?,?,?,?,?)",
-                 (client_id, client_secret, name, json.dumps(uris), now))
+    conn.execute("INSERT INTO oauth_clients VALUES (?,?,?,?,?,?)",
+                 (client_id, client_secret, name, json.dumps(uris), application_type, now))
     conn.commit()
     conn.close()
-    oauth_clients[client_id] = {"client_secret": client_secret, "name": name, "redirect_uris": uris}
+    oauth_clients[client_id] = {
+        "client_secret": client_secret, "name": name, "redirect_uris": uris,
+        "application_type": application_type,
+    }
     logger.info(f"Created OAuth client: {name} ({client_id})")
-    return {"client_id": client_id, "client_secret": client_secret, "name": name}
+    return {"client_id": client_id, "client_secret": client_secret, "name": name, "application_type": application_type}
 
 
 def _redirect_uri_valid(client_id: str, redirect_uri: str) -> bool:
@@ -452,8 +470,15 @@ async def oauth_clients_register(request: Request) -> JSONResponse:
 
     name = data.get("client_name", "unknown-client")
     redirect_uris = data.get("redirect_uris", [])
+    # OIDC Dynamic Client Registration's native-vs-web hint (SEP-837) — MCP
+    # clients now MUST send this; omitting it defaults to "web" under OIDC.
+    # We're not an OIDC provider so we don't enforce anything from it (a
+    # "web" app registering a localhost redirect_uri isn't rejected here),
+    # just accept and echo it back so clients that send it get a clean
+    # registration instead of the field being silently dropped.
+    application_type = data.get("application_type", "web")
     try:
-        client = create_oauth_client(name, redirect_uris)
+        client = create_oauth_client(name, redirect_uris, application_type)
     except Exception as e:
         logger.error(f"DCR create_oauth_client failed: {e}")
         return JSONResponse({"error": "server_error", "error_description": str(e)}, status_code=500)
@@ -466,6 +491,7 @@ async def oauth_clients_register(request: Request) -> JSONResponse:
         "client_secret_expires_at": 0,
         "client_name": name,
         "redirect_uris": redirect_uris,
+        "application_type": client["application_type"],
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
         "token_endpoint_auth_method": "client_secret_post",

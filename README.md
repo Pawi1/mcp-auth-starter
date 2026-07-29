@@ -69,8 +69,15 @@ possession) and there's a basic SSRF guard on the fetch (rejects
 loopback/private/link-local targets; doesn't defend against DNS rebinding,
 see [SECURITY.md](SECURITY.md)).
 
-`/oauth/clients/register` (DCR) is still there and unchanged, for clients
-that don't speak CIMD yet. Authorization responses also now carry an `iss`
+`/oauth/clients/register` (DCR) is still there, for clients that don't
+speak CIMD yet — it now also accepts `application_type` (`"web"` or
+`"native"`, SEP-837) and echoes it back. This server isn't an OIDC
+provider, so it doesn't enforce anything from it (a `"web"` client can
+still register a `localhost` redirect_uri) — it's stored and returned
+purely so clients that send it, as the spec now requires, get a clean
+registration instead of the field being silently dropped.
+
+Authorization responses also now carry an `iss`
 parameter (RFC 9207), so a client talking to more than one authorization
 server can tell them apart.
 
@@ -116,7 +123,7 @@ if name == "my_tool":
 make test
 ```
 
-172 tests, ~75% line coverage (`pytest --cov=app`). `app/config.py` and the
+180 tests, ~75% line coverage (`pytest --cov=app`). `app/config.py` and the
 interactive CLI wizard (`--setup`/`--adduser`) are the main gaps — they're
 either constants or `input()`-driven, both low value to unit test.
 
