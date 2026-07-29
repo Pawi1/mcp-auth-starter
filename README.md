@@ -61,13 +61,20 @@ Per the [2026-07-28 MCP authorization spec](https://modelcontextprotocol.io/spec
 Dynamic Client Registration (RFC 7591) is deprecated in favor of **Client ID
 Metadata Documents** (CIMD, `draft-ietf-oauth-client-id-metadata-document`):
 a client identifies itself with an `https://` URL instead of registering
-up front, and this server fetches a small JSON document from that URL on
-first use (`client_id`, `client_name`, `redirect_uris` — see
-`_fetch_cimd_metadata` in `app/oauth.py`), caching it per `Cache-Control`.
-CIMD clients are public (no `client_secret` — PKCE is what proves
-possession) and there's a basic SSRF guard on the fetch (rejects
-loopback/private/link-local targets; doesn't defend against DNS rebinding,
-see [SECURITY.md](SECURITY.md)).
+up front, and this server fetches a small JSON document (capped at 8 KiB,
+per the draft's ~5 KiB recommendation) from that URL on first use
+(`client_id`, `client_name`, `redirect_uris` — see `_fetch_cimd_metadata`
+in `app/oauth.py`), caching it per `Cache-Control`. The `client_id` URL
+itself is validated against the draft's format rules (`https`, a path, no
+fragment/userinfo/`.`/`..` segments), and a document claiming a
+shared-secret `token_endpoint_auth_method` (`client_secret_post` etc.) is
+rejected outright — a "secret" published in a document anyone can fetch
+isn't one. CIMD clients are otherwise public (no `client_secret` — PKCE is
+what proves possession), and there's a basic SSRF guard on the fetch
+(rejects loopback/private/link-local targets; doesn't defend against DNS
+rebinding, see [SECURITY.md](SECURITY.md)). The consent page shows the
+`client_id`'s hostname alongside the self-reported `client_name`, since
+the hostname is harder to fake.
 
 `/oauth/clients/register` (DCR) is still there, for clients that don't
 speak CIMD yet — it now also accepts `application_type` (`"web"` or
@@ -123,7 +130,7 @@ if name == "my_tool":
 make test
 ```
 
-180 tests, ~75% line coverage (`pytest --cov=app`). `app/config.py` and the
+190 tests, ~76% line coverage (`pytest --cov=app`). `app/config.py` and the
 interactive CLI wizard (`--setup`/`--adduser`) are the main gaps — they're
 either constants or `input()`-driven, both low value to unit test.
 

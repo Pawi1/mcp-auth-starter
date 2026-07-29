@@ -592,6 +592,18 @@ class TestIsCimdClientId:
     def test_empty_string_is_not_cimd(self):
         assert oauth._is_cimd_client_id("") is False
 
+    def test_fragment_is_not_cimd(self):
+        assert oauth._is_cimd_client_id("https://app.example.com/client.json#frag") is False
+
+    def test_userinfo_is_not_cimd(self):
+        assert oauth._is_cimd_client_id("https://user:pass@app.example.com/client.json") is False
+
+    def test_dot_segment_is_not_cimd(self):
+        assert oauth._is_cimd_client_id("https://app.example.com/./client.json") is False
+
+    def test_dot_dot_segment_is_not_cimd(self):
+        assert oauth._is_cimd_client_id("https://app.example.com/../client.json") is False
+
 
 class TestHostIsPublic:
     def test_loopback_rejected(self):
@@ -648,6 +660,27 @@ class TestFetchCimdMetadata:
         doc = {"client_id": self.CID, "client_name": "Test App"}
         _patch_cimd_fetch(monkeypatch, response=_FakeCimdResponse(content=json.dumps(doc).encode()))
         assert await oauth._fetch_cimd_metadata(self.CID) is None
+
+    @pytest.mark.parametrize("auth_method", ["client_secret_post", "client_secret_basic", "client_secret_jwt"])
+    async def test_shared_secret_auth_method_rejected(self, monkeypatch, auth_method):
+        # CIMD draft §4 — a "secret" published in a document anyone can fetch
+        # isn't a secret; a document claiming one is malformed/misconfigured
+        self._bypass_ssrf_check(monkeypatch)
+        doc = {
+            "client_id": self.CID, "client_name": "Test App", "redirect_uris": [],
+            "token_endpoint_auth_method": auth_method,
+        }
+        _patch_cimd_fetch(monkeypatch, response=_FakeCimdResponse(content=json.dumps(doc).encode()))
+        assert await oauth._fetch_cimd_metadata(self.CID) is None
+
+    async def test_none_auth_method_accepted(self, monkeypatch):
+        self._bypass_ssrf_check(monkeypatch)
+        doc = {
+            "client_id": self.CID, "client_name": "Test App", "redirect_uris": [],
+            "token_endpoint_auth_method": "none",
+        }
+        _patch_cimd_fetch(monkeypatch, response=_FakeCimdResponse(content=json.dumps(doc).encode()))
+        assert await oauth._fetch_cimd_metadata(self.CID) == doc
 
     async def test_invalid_json_rejected(self, monkeypatch):
         self._bypass_ssrf_check(monkeypatch)
@@ -741,6 +774,28 @@ class TestOauthAuthorizeCimd:
         login_id = r.headers["location"].split("login_id=")[1].split("&")[0]
         page = test_client.get(f"/oauth/login?login_id={login_id}")
         assert "CIMD App" in page.text
+
+    def test_consent_page_shows_cimd_client_id_hostname(self, test_client, monkeypatch):
+        # the hostname is a harder-to-fake trust signal than the self-reported
+        # client_name (CIMD draft §6.6)
+        doc = {"client_id": self.CID, "client_name": "CIMD App", "redirect_uris": ["https://app.example.com/cb"]}
+        monkeypatch.setattr(oauth, "_fetch_cimd_metadata", AsyncMock(return_value=doc))
+        _, challenge = _pkce_pair()
+        r = test_client.get(
+            f"/oauth/authorize?client_id={self.CID}&redirect_uri=https://app.example.com/cb"
+            f"&state=xyz&code_challenge={challenge}&code_challenge_method=S256"
+        )
+        login_id = r.headers["location"].split("login_id=")[1].split("&")[0]
+        page = test_client.get(f"/oauth/login?login_id={login_id}")
+        assert "app.example.com" in page.text
+
+    def test_consent_page_for_dcr_client_has_no_host_line(self, test_client, tmp_db):
+        # opaque DCR client_ids aren't URLs, so there's no hostname to show
+        oauth._ensure_tokens_table()
+        client = create_oauth_client("Regular App", ["http://localhost/cb"])
+        login_id = _seed_pending(redirect_uri="http://localhost/cb", client_id=client["client_id"])
+        page = test_client.get(f"/oauth/login?login_id={login_id}")
+        assert "Client ID host" not in page.text
 
 
 class TestOauthTokenCimd:

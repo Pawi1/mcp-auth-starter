@@ -44,9 +44,13 @@ _LOGIN_TTL = 600             # seconds a pending login transaction (login_id) st
 _LOGIN_CSRF_COOKIE = "login_csrf"
 
 _CIMD_FETCH_TIMEOUT = 5.0     # seconds to wait for a client's metadata document
-_CIMD_MAX_BYTES = 1_000_000   # refuse to buffer an unbounded response body
+_CIMD_MAX_BYTES = 8 * 1024    # the CIMD draft (§6) recommends ~5 KiB; a little headroom for optional fields
 _CIMD_CACHE_TTL_DEFAULT = 300 # seconds, used when the response has no Cache-Control max-age
 _CIMD_CACHE_TTL_MAX = 3600    # cap how long a document is trusted even if max-age asks for longer
+
+# draft §4 — a document MUST NOT claim a shared-secret auth method (a "secret"
+# published in a document anyone can fetch isn't one)
+_CIMD_FORBIDDEN_AUTH_METHODS = {"client_secret_post", "client_secret_basic", "client_secret_jwt"}
 
 _cimd_cache: dict = {}  # client_id (an https URL) → {"metadata": dict, "expires_at": float}
 
@@ -173,16 +177,23 @@ def _resource_valid(resource: str) -> bool:
 
 
 def _is_cimd_client_id(client_id: str) -> bool:
-    """A Client ID Metadata Document (draft-ietf-oauth-client-id-metadata-document-00)
-    names itself with an https URL that has a path component, e.g.
-    'https://app.example.com/client.json' — anything else (in particular, the
-    opaque ids this server hands out via DCR) is not a CIMD client_id.
+    """A Client ID Metadata Document (draft-ietf-oauth-client-id-metadata-document-00
+    §4) names itself with an https URL that has a path component, e.g.
+    'https://app.example.com/client.json', and per that section MUST NOT carry a
+    fragment, userinfo, or '.'/'..' path segments — anything else (in particular,
+    the opaque ids this server hands out via DCR) is not a CIMD client_id.
     """
     try:
         parsed = urllib.parse.urlsplit(client_id)
     except ValueError:
         return False
-    return parsed.scheme == "https" and bool(parsed.netloc) and parsed.path not in ("", "/")
+    if parsed.scheme != "https" or not parsed.netloc or parsed.path in ("", "/"):
+        return False
+    if parsed.fragment or parsed.username or parsed.password:
+        return False
+    if any(segment in (".", "..") for segment in parsed.path.split("/")):
+        return False
+    return True
 
 
 def _host_is_public(host: str) -> bool:
@@ -239,6 +250,13 @@ async def _fetch_cimd_metadata(client_id: str) -> dict | None:
         or not isinstance(metadata.get("redirect_uris"), list)
     ):
         logger.warning(f"CIMD document at {client_id!r} failed validation")
+        return None
+
+    if metadata.get("token_endpoint_auth_method") in _CIMD_FORBIDDEN_AUTH_METHODS:
+        logger.warning(
+            f"CIMD document at {client_id!r} declares forbidden auth method "
+            f"{metadata.get('token_endpoint_auth_method')!r}"
+        )
         return None
 
     max_age_match = re.search(r"max-age=(\d+)", resp.headers.get("cache-control", ""))
@@ -599,10 +617,20 @@ async def oauth_login(request: Request) -> Response:
     # or CIMD fetch) and carried here rather than re-resolved on every render.
     client_name = _html.escape(pending.get("client_name", "an unregistered application"))
     redirect_display = _html.escape(pending["redirect_uri"]) if pending["redirect_uri"] else "this page (no redirect)"
+
+    # for a CIMD client, client_name is just a string from a JSON document the
+    # client itself hosts — the URL's hostname is the harder-to-fake signal
+    # (CIMD draft §6.6), so show it alongside the self-reported name
+    host_html = ""
+    pending_client_id = pending.get("client_id", "")
+    if _is_cimd_client_id(pending_client_id):
+        host = urllib.parse.urlsplit(pending_client_id).hostname or ""
+        host_html = f'<br>Client ID host: <code>{_html.escape(host)}</code>'
+
     consent_html = f"""
 <div class="info">
   <strong>{client_name}</strong> wants to sign in as you.<br>
-  You'll be redirected to: <code>{redirect_display}</code>
+  You'll be redirected to: <code>{redirect_display}</code>{host_html}
 </div>
 """
 

@@ -59,7 +59,20 @@ generated secrets, default users, etc. as yours to secure per-deployment).
   pin the resolved IP for the actual request, so it doesn't fully close
   DNS-rebinding SSRF. There's no domain allowlist/trust policy either
   (the CIMD spec calls this out as optional) — anyone can mint a
-  `client_id` URL and have this server fetch it.
+  `client_id` URL and have this server fetch it. There's also no
+  `software_statement` (signed-JWT) support — the CIMD draft mentions
+  this as a complementary attestation layer for clients that can't hold
+  a backend secret, but it's a separate, non-trivial feature this
+  starter doesn't implement.
+- This server is a self-contained authorization server + resource
+  server — it mints and validates its own tokens, and never forwards a
+  client's token (or a token it minted on a user's behalf) to any
+  third-party API. That means the "token passthrough" and "confused
+  deputy via OAuth proxy" failure modes that show up in MCP security
+  writeups don't apply here by construction. If you fork this to sit in
+  front of an upstream API, that architecture (and its own token
+  handling) is yours to secure — see [OAuth 2.1 §7](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1-13#name-security-considerations)
+  and the MCP spec's [confused deputy guidance](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/security-considerations#confused-deputy-problem).
 
 ## Supported versions
 
