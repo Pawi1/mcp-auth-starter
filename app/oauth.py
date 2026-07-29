@@ -280,6 +280,17 @@ def _get_pending(login_id: str) -> dict | None:
     return pending
 
 
+def _log_id(value: str, length: int = 12) -> str:
+    """Truncate an identifier before logging it. In oauth_token(), client_id is
+    read from the same request.form() call as client_secret — that proximity
+    is enough for CodeQL's clear-text-logging-sensitive-data check to conflate
+    the two (same root cause as the username/password mislabeling fixed in
+    issue_token()), so log lines there use this instead of the raw value.
+    Slicing also means a log line never contains a full, directly-reusable
+    client_id."""
+    return value[:length] + ("…" if len(value) > length else "")
+
+
 def _parse_basic_auth(header: str) -> tuple:
     """Decode an `Authorization: Basic base64(client_id:client_secret)` header."""
     if not header.startswith("Basic "):
@@ -751,7 +762,7 @@ async def oauth_token(request: Request) -> JSONResponse:
             )
         client = oauth_clients.get(client_id)
         if not client or not secrets.compare_digest(client_secret, client["client_secret"]):
-            logger.warning(f"OAuth refresh rejected: client authentication failed for client_id={client_id!r}")
+            logger.warning(f"OAuth refresh rejected: client authentication failed for client_id={_log_id(client_id)!r}")
             return JSONResponse(
                 {"error": "invalid_client", "error_description": "Client authentication failed"},
                 status_code=401,
@@ -793,7 +804,7 @@ async def oauth_token(request: Request) -> JSONResponse:
             # PKCE, checked below, is what actually proves this request came from
             # whoever received the code, same as any other public client.
             if client_id != info["client_id"]:
-                logger.warning(f"OAuth token rejected: client_id mismatch for CIMD client={info['client_id']!r}")
+                logger.warning(f"OAuth token rejected: client_id mismatch for CIMD client={_log_id(info['client_id'])!r}")
                 return JSONResponse(
                     {"error": "invalid_client", "error_description": "Client authentication failed"},
                     status_code=401,
@@ -805,7 +816,7 @@ async def oauth_token(request: Request) -> JSONResponse:
                 or not client
                 or not secrets.compare_digest(client_secret, client["client_secret"])
             ):
-                logger.warning(f"OAuth token rejected: client authentication failed for client_id={client_id!r}")
+                logger.warning(f"OAuth token rejected: client authentication failed for client_id={_log_id(client_id)!r}")
                 return JSONResponse(
                     {"error": "invalid_client", "error_description": "Client authentication failed"},
                     status_code=401,
