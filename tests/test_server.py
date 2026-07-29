@@ -1,6 +1,7 @@
 """Tests for server.py — the demo `whoami` tool and the auth gate in call_tool()."""
 
 import json
+import sqlite3
 
 import pytest
 
@@ -13,6 +14,15 @@ def reset_current_user():
     token = current_user.set(None)
     yield
     current_user.reset(token)
+
+
+@pytest.fixture(autouse=True)
+def tmp_db(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr("users.DB_PATH", db_path)
+    import users as _users
+    _users._ensure_db_schema()
+    return db_path
 
 
 def _result_json(result):
@@ -55,3 +65,36 @@ class TestWhoami:
         result = await server.call_tool("whoami", {})
         data = _result_json(result)
         assert data == {"username": "alice", "teams": ["admins", "beta"]}
+
+
+class TestToolCallAudit:
+    async def test_successful_call_is_audited(self, tmp_db):
+        current_user.set({"username": "alice", "teams": ["admins"]})
+        await server.call_tool("whoami", {})
+        conn = sqlite3.connect(str(tmp_db))
+        row = conn.execute(
+            "SELECT success FROM tool_call_log WHERE username='alice' AND tool_name='whoami'"
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row[0] == 1
+
+    async def test_unknown_tool_is_audited_as_failure(self, tmp_db):
+        current_user.set({"username": "alice", "teams": ["admins"]})
+        await server.call_tool("delete_everything", {})
+        conn = sqlite3.connect(str(tmp_db))
+        row = conn.execute(
+            "SELECT success, reason FROM tool_call_log WHERE username='alice' AND tool_name='delete_everything'"
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row[0] == 0
+        assert row[1] == "unknown_tool"
+
+    async def test_unauthenticated_call_is_not_audited(self, tmp_db):
+        current_user.set(None)
+        await server.call_tool("whoami", {})
+        conn = sqlite3.connect(str(tmp_db))
+        count = conn.execute("SELECT COUNT(*) FROM tool_call_log").fetchone()[0]
+        conn.close()
+        assert count == 0

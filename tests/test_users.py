@@ -13,6 +13,7 @@ from users import (
     get_user,
     hash_password,
     log_login_attempt,
+    log_tool_call,
     verify_user,
 )
 
@@ -137,6 +138,41 @@ class TestLogLoginAttempt:
     def test_db_write_failure_does_not_raise(self, monkeypatch):
         monkeypatch.setattr("users.DB_PATH", Path("/no/such/path/db.sqlite"))
         log_login_attempt("alice", "1.2.3.4", success=True)  # must not raise
+
+
+class TestLogToolCall:
+    def test_success_stored(self, tmp_db):
+        log_tool_call("alice", "whoami")
+        conn = sqlite3.connect(str(tmp_db))
+        row = conn.execute(
+            "SELECT success, reason FROM tool_call_log WHERE username='alice' AND tool_name='whoami'"
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row[0] == 1
+        assert row[1] == ""
+
+    def test_failure_stored_with_reason(self, tmp_db):
+        log_tool_call("alice", "delete_everything", success=False, reason="unknown_tool")
+        conn = sqlite3.connect(str(tmp_db))
+        row = conn.execute(
+            "SELECT success, reason FROM tool_call_log WHERE username='alice' AND success=0"
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row[1] == "unknown_tool"
+
+    def test_multiple_calls_all_stored(self, tmp_db):
+        for _ in range(3):
+            log_tool_call("bob", "whoami")
+        conn = sqlite3.connect(str(tmp_db))
+        count = conn.execute("SELECT COUNT(*) FROM tool_call_log WHERE username='bob'").fetchone()[0]
+        conn.close()
+        assert count == 3
+
+    def test_db_write_failure_does_not_raise(self, monkeypatch):
+        monkeypatch.setattr("users.DB_PATH", Path("/no/such/path/db.sqlite"))
+        log_tool_call("alice", "whoami")  # must not raise
 
 
 class TestUpgradePassword:

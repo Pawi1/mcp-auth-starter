@@ -50,6 +50,14 @@ def _ensure_db_schema():
         success INTEGER NOT NULL DEFAULT 0,
         reason TEXT DEFAULT ''
     )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS tool_call_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL NOT NULL,
+        username TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        success INTEGER NOT NULL DEFAULT 1,
+        reason TEXT DEFAULT ''
+    )""")
     conn.commit()
     conn.close()
 
@@ -68,6 +76,22 @@ def log_login_attempt(username: str, ip: str, success: bool, reason: str = "") -
 
     if not success:
         _check_login_anomaly(ip)
+
+
+def log_tool_call(username: str, tool_name: str, success: bool = True, reason: str = "") -> None:
+    """Durable, queryable record of who called which tool and whether it was
+    allowed — so 'who ran delete_customer, and when' is a query against
+    tool_call_log, not a grep through log files after the fact."""
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.execute(
+            "INSERT INTO tool_call_log (ts, username, tool_name, success, reason) VALUES (?,?,?,?,?)",
+            (time.time(), username, tool_name, int(success), reason)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"tool_call_log write failed: {e}")
 
 
 def _check_login_anomaly(ip: str) -> None:

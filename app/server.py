@@ -17,6 +17,7 @@ from mcp.types import Tool, TextContent
 
 from config import MCP_SERVER_NAME
 from context import current_user
+from users import log_tool_call
 
 logger = logging.getLogger("mcp-auth-starter")
 
@@ -54,9 +55,14 @@ async def call_tool(name: str, arguments: dict) -> List[TextContent]:
     if not user:
         return _ok({"error": "Not authenticated — connect via OAuth"})
 
-    logger.info(f"Tool call: {name} by {user['username']}")
-
+    # keep this pair (log line + log_tool_call) together in every branch you
+    # add below — the log line is for tailing, log_tool_call is the durable,
+    # queryable audit trail (tool_call_log)
     if name == "whoami":
+        logger.info(f"Tool call: {name} by {user['username']}")
+        log_tool_call(user["username"], name)
         return _ok({"username": user["username"], "teams": user["teams"]})
 
+    logger.warning(f"Tool call rejected: unknown tool {name!r} requested by {user['username']}")
+    log_tool_call(user["username"], name, success=False, reason="unknown_tool")
     return _ok({"error": f"Unknown tool: {name}"})

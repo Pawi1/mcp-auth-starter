@@ -1,3 +1,5 @@
+import base64
+import json
 import time
 
 import pytest
@@ -18,6 +20,22 @@ def _make_token(username="testuser", teams=None, exp_offset=3600, aud=None):
     if aud is not None:
         payload["aud"] = aud
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def _b64url(data: dict) -> str:
+    return base64.urlsafe_b64encode(json.dumps(data).encode()).rstrip(b"=").decode()
+
+
+def _make_alg_none_token(username="attacker", teams=None, exp_offset=3600) -> str:
+    """Hand-crafts the classic 'alg: none' attack token — no signature at all,
+    just a header claiming none is needed. verify_token must reject this on
+    the strength of the explicit `algorithms=[ALGORITHM]` allowlist passed to
+    jwt.decode, not on the (absent) signature."""
+    if teams is None:
+        teams = ["admins"]
+    header = {"alg": "none", "typ": "JWT"}
+    payload = {"sub": username, "teams": teams, "exp": int(time.time()) + exp_offset}
+    return f"{_b64url(header)}.{_b64url(payload)}."
 
 
 class TestVerifyToken:
@@ -83,5 +101,33 @@ class TestVerifyTokenAudience:
 
     async def test_token_with_mismatched_aud_is_rejected(self):
         token = _make_token(aud="https://someone-elses-mcp-server.example/mcp")
+        with pytest.raises(ValueError, match="Invalid token"):
+            await verify_token(token)
+
+
+# ---------------------------------------------------------------------------
+# algorithm confusion — verify_token only trusts ALGORITHM (HS256), never
+# whatever algorithm the token's own header claims
+# ---------------------------------------------------------------------------
+
+class TestVerifyTokenAlgorithm:
+    async def test_alg_none_token_is_rejected(self):
+        token = _make_alg_none_token()
+        with pytest.raises(ValueError, match="Invalid token"):
+            await verify_token(token)
+
+    async def test_alg_none_is_rejected_even_with_admin_claims(self):
+        # the interesting case isn't "malformed token" but "otherwise-valid-
+        # looking claims, just unsigned" — this must fail the same way
+        token = _make_alg_none_token(username="root", teams=["admins", "superuser"])
+        with pytest.raises(ValueError):
+            await verify_token(token)
+
+    async def test_wrong_algorithm_is_rejected(self):
+        # signed with the real secret, but a different algorithm than this
+        # server is configured for — jwt.decode's algorithms=[ALGORITHM]
+        # allowlist must reject it regardless of signature validity
+        payload = {"sub": "user", "teams": [], "exp": int(time.time()) + 3600}
+        token = jwt.encode(payload, SECRET_KEY, algorithm="HS384")
         with pytest.raises(ValueError, match="Invalid token"):
             await verify_token(token)

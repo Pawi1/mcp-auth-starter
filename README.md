@@ -23,7 +23,7 @@ prove the auth chain works end to end. Your actual tools go in `app/server.py`.
 | `app/main.py` | Starlette app, `/mcp` endpoint + auth gate, lifespan, CLI (`--setup`, `--adduser`) |
 | `app/oauth.py` | Full OAuth 2.0 flow: discovery, client registration (CIMD + DCR), authorize/login/token (+ refresh grant with rotation), revocation, rate limiting |
 | `app/auth.py` | JWT verification (signature, expiry, audience) |
-| `app/users.py` | User accounts (argon2 password hashing), login attempt logging |
+| `app/users.py` | User accounts (argon2 password hashing), login attempt + tool-call audit logging |
 | `app/context.py` | `ContextVar` carrying the authenticated user into your tool handlers |
 | `app/server.py` | MCP tool definitions — **this is where you add your own tools** |
 | `app/config.py` | Config loader (`config.json` + env var overrides for secrets) |
@@ -117,10 +117,14 @@ prompt you to log in with the admin account you just created.
 Edit `app/server.py`: add one `Tool(...)` entry to `list_tools()` and a
 matching `if name == "...":` branch in `call_tool()`. `current_user.get()`
 is always populated by the time `call_tool()` runs — the auth gate rejects
-the request before it reaches here otherwise.
+the request before it reaches here otherwise. Call `log_tool_call(user["username"], name)`
+in your branch too, so "who ran this tool, and when" stays a query against
+`tool_call_log` (see `app/users.py`) instead of a grep through log files
+after the fact.
 
 ```python
 if name == "my_tool":
+    log_tool_call(user["username"], name)
     return _ok({"result": do_something(arguments)})
 ```
 
@@ -130,7 +134,7 @@ if name == "my_tool":
 make test
 ```
 
-190 tests, ~76% line coverage (`pytest --cov=app`). `app/config.py` and the
+200 tests, ~76% line coverage (`pytest --cov=app`). `app/config.py` and the
 interactive CLI wizard (`--setup`/`--adduser`) are the main gaps — they're
 either constants or `input()`-driven, both low value to unit test.
 
