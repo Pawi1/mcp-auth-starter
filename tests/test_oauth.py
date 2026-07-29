@@ -8,11 +8,13 @@
 """
 
 import html
+import json
 import secrets
 import sqlite3
 import time
+import urllib.parse
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from starlette.applications import Starlette
@@ -102,15 +104,19 @@ def _pkce_pair():
     return verifier, challenge
 
 
-def _seed_pending(redirect_uri="", client_id="", state="", code_challenge=None, issued_at=None):
+def _seed_pending(redirect_uri="", client_id="", state="", code_challenge=None, issued_at=None, client_name=None):
     if code_challenge is None:
         _, code_challenge = _pkce_pair()
+    if client_name is None:
+        # mirrors what oauth_authorize resolves before creating a pending entry
+        registered = oauth_clients.get(client_id)
+        client_name = registered["name"] if registered else "an unregistered application"
     login_id = secrets.token_urlsafe(16)
     oauth_pending[login_id] = {
         "redirect_uri": redirect_uri, "client_id": client_id,
         "state": state, "code_challenge": code_challenge,
         "issued_at": issued_at if issued_at is not None else time.time(),
-        "csrf_token": secrets.token_urlsafe(24),
+        "csrf_token": secrets.token_urlsafe(24), "client_name": client_name,
     }
     return login_id
 
@@ -432,12 +438,13 @@ class TestOauthClientsRegister:
 
 
 class TestOauthMetadata:
-    def test_does_not_advertise_none_auth_method(self, test_client):
-        # every DCR-registered client gets a client_secret and /oauth/token
-        # requires it — advertising "none" would tell public clients they
-        # can skip auth, which they can't
+    def test_advertises_none_auth_method_for_cimd_clients(self, test_client):
+        # "none" is legitimate here: CIMD clients (client_id is an https URL, no
+        # pre-shared secret) authenticate via PKCE instead — see
+        # TestOauthTokenCimd. DCR-registered clients still always get a
+        # client_secret and /oauth/token still requires it for those.
         body = test_client.get("/.well-known/oauth-authorization-server").json()
-        assert "none" not in body["token_endpoint_auth_methods_supported"]
+        assert "none" in body["token_endpoint_auth_methods_supported"]
 
     def test_advertises_client_secret_methods(self, test_client):
         body = test_client.get("/.well-known/oauth-authorization-server").json()
@@ -447,6 +454,257 @@ class TestOauthMetadata:
     def test_advertises_refresh_token_grant(self, test_client):
         body = test_client.get("/.well-known/oauth-authorization-server").json()
         assert "refresh_token" in body["grant_types_supported"]
+
+    def test_advertises_cimd_support(self, test_client):
+        body = test_client.get("/.well-known/oauth-authorization-server").json()
+        assert body["client_id_metadata_document_supported"] is True
+
+    def test_advertises_iss_parameter_support(self, test_client):
+        body = test_client.get("/.well-known/oauth-authorization-server").json()
+        assert body["authorization_response_iss_parameter_supported"] is True
+
+
+# ---------------------------------------------------------------------------
+# Client ID Metadata Documents (CIMD, draft-ietf-oauth-client-id-metadata-document)
+# ---------------------------------------------------------------------------
+
+class _FakeCimdResponse:
+    def __init__(self, status_code=200, content=b"{}", headers=None):
+        self.status_code = status_code
+        self.content = content
+        self.headers = headers or {}
+
+
+class _FakeAsyncClient:
+    """Stands in for httpx.AsyncClient so CIMD fetch tests don't touch the network."""
+    def __init__(self, response=None, exc=None, **_kwargs):
+        self._response = response
+        self._exc = exc
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_a):
+        return False
+
+    async def get(self, _url):
+        if self._exc:
+            raise self._exc
+        return self._response
+
+
+def _patch_cimd_fetch(monkeypatch, response=None, exc=None, track_calls=None):
+    def factory(*_a, **_k):
+        if track_calls is not None:
+            track_calls.append(1)
+        return _FakeAsyncClient(response=response, exc=exc)
+    monkeypatch.setattr(oauth.httpx, "AsyncClient", factory)
+
+
+class TestIsCimdClientId:
+    def test_https_url_with_path_is_cimd(self):
+        assert oauth._is_cimd_client_id("https://app.example.com/client.json") is True
+
+    def test_opaque_dcr_id_is_not_cimd(self):
+        assert oauth._is_cimd_client_id(secrets.token_urlsafe(16)) is False
+
+    def test_http_scheme_is_not_cimd(self):
+        assert oauth._is_cimd_client_id("http://app.example.com/client.json") is False
+
+    def test_bare_domain_without_path_is_not_cimd(self):
+        assert oauth._is_cimd_client_id("https://app.example.com") is False
+        assert oauth._is_cimd_client_id("https://app.example.com/") is False
+
+    def test_empty_string_is_not_cimd(self):
+        assert oauth._is_cimd_client_id("") is False
+
+
+class TestHostIsPublic:
+    def test_loopback_rejected(self):
+        assert oauth._host_is_public("127.0.0.1") is False
+
+    def test_private_range_rejected(self):
+        assert oauth._host_is_public("10.0.0.5") is False
+
+    def test_link_local_rejected(self):
+        assert oauth._host_is_public("169.254.1.1") is False
+
+    def test_unresolvable_host_rejected(self):
+        assert oauth._host_is_public("this-host-does-not-exist.invalid") is False
+
+    def test_public_ip_allowed(self):
+        assert oauth._host_is_public("8.8.8.8") is True
+
+
+class TestFetchCimdMetadata:
+    CID = "https://app.example.com/client.json"
+
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self):
+        oauth._cimd_cache.clear()
+        yield
+        oauth._cimd_cache.clear()
+
+    def _bypass_ssrf_check(self, monkeypatch):
+        # these tests exercise document fetch/validation, not the SSRF guard
+        # itself (that's TestHostIsPublic + test_private_host_blocked_below) —
+        # bypassing it here also sidesteps needing real DNS for app.example.com
+        monkeypatch.setattr(oauth, "_host_is_public", lambda host: True)
+
+    async def test_valid_document_is_returned(self, monkeypatch):
+        self._bypass_ssrf_check(monkeypatch)
+        doc = {"client_id": self.CID, "client_name": "Test App", "redirect_uris": ["https://app.example.com/cb"]}
+        _patch_cimd_fetch(monkeypatch, response=_FakeCimdResponse(content=json.dumps(doc).encode()))
+        assert await oauth._fetch_cimd_metadata(self.CID) == doc
+
+    async def test_client_id_mismatch_rejected(self, monkeypatch):
+        self._bypass_ssrf_check(monkeypatch)
+        doc = {"client_id": "https://other.example.com/client.json", "client_name": "X", "redirect_uris": []}
+        _patch_cimd_fetch(monkeypatch, response=_FakeCimdResponse(content=json.dumps(doc).encode()))
+        assert await oauth._fetch_cimd_metadata(self.CID) is None
+
+    async def test_missing_client_name_rejected(self, monkeypatch):
+        self._bypass_ssrf_check(monkeypatch)
+        doc = {"client_id": self.CID, "redirect_uris": []}
+        _patch_cimd_fetch(monkeypatch, response=_FakeCimdResponse(content=json.dumps(doc).encode()))
+        assert await oauth._fetch_cimd_metadata(self.CID) is None
+
+    async def test_missing_redirect_uris_rejected(self, monkeypatch):
+        self._bypass_ssrf_check(monkeypatch)
+        doc = {"client_id": self.CID, "client_name": "Test App"}
+        _patch_cimd_fetch(monkeypatch, response=_FakeCimdResponse(content=json.dumps(doc).encode()))
+        assert await oauth._fetch_cimd_metadata(self.CID) is None
+
+    async def test_invalid_json_rejected(self, monkeypatch):
+        self._bypass_ssrf_check(monkeypatch)
+        _patch_cimd_fetch(monkeypatch, response=_FakeCimdResponse(content=b"not json"))
+        assert await oauth._fetch_cimd_metadata(self.CID) is None
+
+    async def test_non_200_status_rejected(self, monkeypatch):
+        self._bypass_ssrf_check(monkeypatch)
+        _patch_cimd_fetch(monkeypatch, response=_FakeCimdResponse(status_code=404))
+        assert await oauth._fetch_cimd_metadata(self.CID) is None
+
+    async def test_oversized_response_rejected(self, monkeypatch):
+        self._bypass_ssrf_check(monkeypatch)
+        doc = {
+            "client_id": self.CID, "client_name": "Test App", "redirect_uris": [],
+            "pad": "a" * (oauth._CIMD_MAX_BYTES + 1),
+        }
+        _patch_cimd_fetch(monkeypatch, response=_FakeCimdResponse(content=json.dumps(doc).encode()))
+        assert await oauth._fetch_cimd_metadata(self.CID) is None
+
+    async def test_fetch_exception_rejected(self, monkeypatch):
+        self._bypass_ssrf_check(monkeypatch)
+        import httpx
+        _patch_cimd_fetch(monkeypatch, exc=httpx.ConnectError("boom"))
+        assert await oauth._fetch_cimd_metadata(self.CID) is None
+
+    async def test_private_host_blocked_before_any_network_call(self, monkeypatch):
+        # real _host_is_public here (not bypassed) — this is the one test that
+        # exercises the actual SSRF guard, using a loopback literal so it needs
+        # no DNS either
+        calls = []
+        _patch_cimd_fetch(monkeypatch, response=_FakeCimdResponse(), track_calls=calls)
+        result = await oauth._fetch_cimd_metadata("https://127.0.0.1/client.json")
+        assert result is None
+        assert calls == []
+
+    async def test_result_is_cached_across_calls(self, monkeypatch):
+        self._bypass_ssrf_check(monkeypatch)
+        doc = {"client_id": self.CID, "client_name": "Test App", "redirect_uris": []}
+        calls = []
+        _patch_cimd_fetch(monkeypatch, response=_FakeCimdResponse(content=json.dumps(doc).encode()), track_calls=calls)
+        await oauth._fetch_cimd_metadata(self.CID)
+        await oauth._fetch_cimd_metadata(self.CID)
+        assert len(calls) == 1
+
+
+class TestOauthAuthorizeCimd:
+    CID = "https://app.example.com/client.json"
+
+    def test_valid_cimd_client_redirects_to_login(self, test_client, monkeypatch):
+        doc = {"client_id": self.CID, "client_name": "CIMD App", "redirect_uris": ["https://app.example.com/cb"]}
+        monkeypatch.setattr(oauth, "_fetch_cimd_metadata", AsyncMock(return_value=doc))
+        _, challenge = _pkce_pair()
+        r = test_client.get(
+            f"/oauth/authorize?client_id={self.CID}&redirect_uri=https://app.example.com/cb"
+            f"&state=xyz&code_challenge={challenge}&code_challenge_method=S256"
+        )
+        assert r.status_code in (302, 303, 307)
+        login_id = r.headers["location"].split("login_id=")[1].split("&")[0]
+        assert oauth_pending[login_id]["client_name"] == "CIMD App"
+
+    def test_rejects_when_document_cannot_be_fetched(self, test_client, monkeypatch):
+        monkeypatch.setattr(oauth, "_fetch_cimd_metadata", AsyncMock(return_value=None))
+        _, challenge = _pkce_pair()
+        r = test_client.get(
+            f"/oauth/authorize?client_id={self.CID}&redirect_uri=https://app.example.com/cb"
+            f"&state=xyz&code_challenge={challenge}&code_challenge_method=S256"
+        )
+        assert r.status_code == 400
+        assert r.json()["error"] == "invalid_client"
+
+    def test_rejects_redirect_uri_not_in_document(self, test_client, monkeypatch):
+        doc = {"client_id": self.CID, "client_name": "CIMD App", "redirect_uris": ["https://app.example.com/cb"]}
+        monkeypatch.setattr(oauth, "_fetch_cimd_metadata", AsyncMock(return_value=doc))
+        _, challenge = _pkce_pair()
+        r = test_client.get(
+            f"/oauth/authorize?client_id={self.CID}&redirect_uri=https://evil.example/cb"
+            f"&state=xyz&code_challenge={challenge}&code_challenge_method=S256"
+        )
+        assert r.status_code == 400
+        assert r.json()["error"] == "invalid_request"
+
+    def test_consent_page_shows_cimd_client_name(self, test_client, monkeypatch):
+        doc = {"client_id": self.CID, "client_name": "CIMD App", "redirect_uris": ["https://app.example.com/cb"]}
+        monkeypatch.setattr(oauth, "_fetch_cimd_metadata", AsyncMock(return_value=doc))
+        _, challenge = _pkce_pair()
+        r = test_client.get(
+            f"/oauth/authorize?client_id={self.CID}&redirect_uri=https://app.example.com/cb"
+            f"&state=xyz&code_challenge={challenge}&code_challenge_method=S256"
+        )
+        login_id = r.headers["location"].split("login_id=")[1].split("&")[0]
+        page = test_client.get(f"/oauth/login?login_id={login_id}")
+        assert "CIMD App" in page.text
+
+
+class TestOauthTokenCimd:
+    CID = "https://app.example.com/client.json"
+
+    def test_token_exchange_succeeds_without_client_secret(self, test_client, tmp_db, dummy_user):
+        verifier, challenge = _pkce_pair()
+        oauth_codes["cimd-code1"] = {
+            "redirect_uri": "https://app.example.com/cb", "state": "s", "username": dummy_user,
+            "issued_at": time.time(), "client_id": self.CID, "code_challenge": challenge,
+        }
+        r = test_client.post("/oauth/token", data={
+            "code": "cimd-code1", "client_id": self.CID, "code_verifier": verifier,
+        })
+        assert r.status_code == 200
+        assert "access_token" in r.json()
+
+    def test_rejects_client_id_mismatch(self, test_client, tmp_db, dummy_user):
+        verifier, challenge = _pkce_pair()
+        oauth_codes["cimd-code2"] = {
+            "redirect_uri": "https://app.example.com/cb", "state": "s", "username": dummy_user,
+            "issued_at": time.time(), "client_id": self.CID, "code_challenge": challenge,
+        }
+        r = test_client.post("/oauth/token", data={
+            "code": "cimd-code2", "client_id": "https://attacker.example/client.json", "code_verifier": verifier,
+        })
+        assert r.status_code == 401
+
+    def test_still_requires_correct_pkce_verifier(self, test_client, tmp_db, dummy_user):
+        _, challenge = _pkce_pair()
+        oauth_codes["cimd-code3"] = {
+            "redirect_uri": "https://app.example.com/cb", "state": "s", "username": dummy_user,
+            "issued_at": time.time(), "client_id": self.CID, "code_challenge": challenge,
+        }
+        r = test_client.post("/oauth/token", data={
+            "code": "cimd-code3", "client_id": self.CID, "code_verifier": "wrong-verifier",
+        })
+        assert r.status_code == 400
 
 
 class TestOauthAuthorize:
@@ -647,6 +905,20 @@ class TestOauthLoginPost:
         loc = r.headers["location"]
         assert "code=" in loc
         assert "mystate" in loc
+
+    def test_success_redirect_includes_iss(self, test_client, tmp_db, dummy_user):
+        # RFC 9207 — lets the client detect a response mixed up with a
+        # different authorization server it also talks to
+        login_id = _seed_pending(redirect_uri="http://localhost/cb", client_id="c", state="mystate")
+        _set_login_cookie(test_client, login_id)
+        with patch("users.log_login_attempt"):
+            r = test_client.post(
+                f"/oauth/login?login_id={login_id}",
+                data={"username": dummy_user, "password": "password123"},
+            )
+        assert r.status_code in (302, 303)
+        query = urllib.parse.urlsplit(r.headers["location"]).query
+        assert urllib.parse.parse_qs(query)["iss"][0] == "http://localhost:8000"
 
     def test_success_without_redirect_shows_html(self, test_client, tmp_db, dummy_user):
         login_id = _seed_pending(redirect_uri="", client_id="c")

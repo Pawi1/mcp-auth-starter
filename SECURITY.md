@@ -52,6 +52,14 @@ generated secrets, default users, etc. as yours to secure per-deployment).
   connector" use, but production deployments serving untrusted clients
   may want an allowlist, admin approval, or a trusted-client policy in
   front of it.
+- Client ID Metadata Documents (CIMD) are trusted on first fetch and
+  cached in-memory only (`_cimd_cache` in `app/oauth.py`) — same
+  cross-process caveat as above. `_host_is_public` blocks fetches to
+  loopback/private/link-local addresses at resolution time, but doesn't
+  pin the resolved IP for the actual request, so it doesn't fully close
+  DNS-rebinding SSRF. There's no domain allowlist/trust policy either
+  (the CIMD spec calls this out as optional) — anyone can mint a
+  `client_id` URL and have this server fetch it.
 
 ## Supported versions
 

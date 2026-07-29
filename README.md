@@ -5,12 +5,12 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 A minimal, working example of the part of building an MCP server that's
-annoying to get right: **OAuth 2.0 with Dynamic Client Registration (RFC
-7591) + JWT bearer tokens, served over Streamable HTTP** — so Claude.ai (or
-any other OAuth-aware MCP client) can add your server as a connector with a
-normal browser login. No manual token pasting, no bypassing OAuth with a
-"just give me a token" shortcut that quietly stops working the moment you
-add real revocation.
+annoying to get right: **OAuth 2.0 with Client ID Metadata Documents (and
+Dynamic Client Registration, RFC 7591, as a fallback) + JWT bearer tokens,
+served over Streamable HTTP** — so Claude.ai (or any other OAuth-aware MCP
+client) can add your server as a connector with a normal browser login. No
+manual token pasting, no bypassing OAuth with a "just give me a token"
+shortcut that quietly stops working the moment you add real revocation.
 
 This is *not* a framework — it's ~1200 lines of plain Starlette you're meant
 to read, fork, and build on. There's exactly one demo tool (`whoami`) to
@@ -21,7 +21,7 @@ prove the auth chain works end to end. Your actual tools go in `app/server.py`.
 | File | What it does |
 |---|---|
 | `app/main.py` | Starlette app, `/mcp` endpoint + auth gate, lifespan, CLI (`--setup`, `--adduser`) |
-| `app/oauth.py` | Full OAuth 2.0 flow: discovery, Dynamic Client Registration, authorize/login/token (+ refresh grant with rotation), revocation, rate limiting |
+| `app/oauth.py` | Full OAuth 2.0 flow: discovery, client registration (CIMD + DCR), authorize/login/token (+ refresh grant with rotation), revocation, rate limiting |
 | `app/auth.py` | JWT verification (signature, expiry, audience) |
 | `app/users.py` | User accounts (argon2 password hashing), login attempt logging |
 | `app/context.py` | `ContextVar` carrying the authenticated user into your tool handlers |
@@ -54,6 +54,25 @@ URI, and `/oauth/authorize`/`/oauth/token` validate an optional `resource`
 parameter (RFC 8707) against it — so a token minted here can't be replayed
 against a different resource server even if it somehow shared your
 `SECRET_KEY`.
+
+## Client registration: CIMD, then DCR
+
+Per the [2026-07-28 MCP authorization spec](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/client-registration),
+Dynamic Client Registration (RFC 7591) is deprecated in favor of **Client ID
+Metadata Documents** (CIMD, `draft-ietf-oauth-client-id-metadata-document`):
+a client identifies itself with an `https://` URL instead of registering
+up front, and this server fetches a small JSON document from that URL on
+first use (`client_id`, `client_name`, `redirect_uris` — see
+`_fetch_cimd_metadata` in `app/oauth.py`), caching it per `Cache-Control`.
+CIMD clients are public (no `client_secret` — PKCE is what proves
+possession) and there's a basic SSRF guard on the fetch (rejects
+loopback/private/link-local targets; doesn't defend against DNS rebinding,
+see [SECURITY.md](SECURITY.md)).
+
+`/oauth/clients/register` (DCR) is still there and unchanged, for clients
+that don't speak CIMD yet. Authorization responses also now carry an `iss`
+parameter (RFC 9207), so a client talking to more than one authorization
+server can tell them apart.
 
 ## Quick start
 
@@ -97,7 +116,7 @@ if name == "my_tool":
 make test
 ```
 
-142 tests, ~73% line coverage (`pytest --cov=app`). `app/config.py` and the
+172 tests, ~75% line coverage (`pytest --cov=app`). `app/config.py` and the
 interactive CLI wizard (`--setup`/`--adduser`) are the main gaps — they're
 either constants or `input()`-driven, both low value to unit test.
 

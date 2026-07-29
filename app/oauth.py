@@ -1,20 +1,25 @@
 """
-MCP Auth Starter — OAuth 2.0 (RFC 6749 authorization code flow + RFC 7591
-Dynamic Client Registration + RFC 8414/8707 discovery), enough for Claude.ai
-and other MCP clients to add this server as a connector with a normal
-browser login, no manual token pasting required.
+MCP Auth Starter — OAuth 2.0 (RFC 6749 authorization code flow, Client ID
+Metadata Documents with RFC 7591 Dynamic Client Registration as a fallback
+for client identification, RFC 8414/8707/9728 discovery, RFC 9207 issuer
+validation), enough for Claude.ai and other MCP clients to add this server
+as a connector with a normal browser login, no manual token pasting required.
 """
 
 import base64
 import hashlib
 import html as _html
+import ipaddress
 import json
 import logging
 import re
 import secrets
+import socket
 import sqlite3
 import time
+import urllib.parse
 
+import httpx
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
@@ -37,6 +42,13 @@ _RATE_WINDOW = 60            # seconds
 _AUTH_CODE_TTL = 60          # seconds an authorization code stays redeemable
 _LOGIN_TTL = 600             # seconds a pending login transaction (login_id) stays valid
 _LOGIN_CSRF_COOKIE = "login_csrf"
+
+_CIMD_FETCH_TIMEOUT = 5.0     # seconds to wait for a client's metadata document
+_CIMD_MAX_BYTES = 1_000_000   # refuse to buffer an unbounded response body
+_CIMD_CACHE_TTL_DEFAULT = 300 # seconds, used when the response has no Cache-Control max-age
+_CIMD_CACHE_TTL_MAX = 3600    # cap how long a document is trusted even if max-age asks for longer
+
+_cimd_cache: dict = {}  # client_id (an https URL) → {"metadata": dict, "expires_at": float}
 
 
 def _check_rate_limit(ip: str) -> bool:
@@ -140,6 +152,81 @@ def _resource_valid(resource: str) -> bool:
     one is rejected outright rather than silently issuing a token for the wrong resource.
     """
     return not resource or resource.rstrip("/") == MCP_RESOURCE_URI.rstrip("/")
+
+
+def _is_cimd_client_id(client_id: str) -> bool:
+    """A Client ID Metadata Document (draft-ietf-oauth-client-id-metadata-document-00)
+    names itself with an https URL that has a path component, e.g.
+    'https://app.example.com/client.json' — anything else (in particular, the
+    opaque ids this server hands out via DCR) is not a CIMD client_id.
+    """
+    try:
+        parsed = urllib.parse.urlsplit(client_id)
+    except ValueError:
+        return False
+    return parsed.scheme == "https" and bool(parsed.netloc) and parsed.path not in ("", "/")
+
+
+def _host_is_public(host: str) -> bool:
+    """Reject loopback/private/link-local targets before fetching a client-supplied
+    metadata URL, so a malicious client_id can't be used to probe internal network
+    services (SSRF — CIMD draft §6.3). Doesn't defend against DNS rebinding between
+    this check and the actual fetch; see SECURITY.md."""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return False
+    for _family, _type, _proto, _canonname, sockaddr in infos:
+        ip = ipaddress.ip_address(sockaddr[0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+            return False
+    return True
+
+
+async def _fetch_cimd_metadata(client_id: str) -> dict | None:
+    """Fetch and validate a Client ID Metadata Document for a client_id that's an
+    https URL. Returns None on any fetch or validation failure — callers treat
+    that the same as an unknown/unregistered client rather than raising.
+    """
+    cached = _cimd_cache.get(client_id)
+    if cached and cached["expires_at"] > time.time():
+        return cached["metadata"]
+
+    host = urllib.parse.urlsplit(client_id).hostname or ""
+    if not _host_is_public(host):
+        logger.warning(f"CIMD fetch blocked: {host!r} does not resolve to a public address")
+        return None
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=False, timeout=_CIMD_FETCH_TIMEOUT) as http:
+            resp = await http.get(client_id)
+    except httpx.HTTPError as e:
+        logger.warning(f"CIMD fetch failed for {client_id!r}: {e}")
+        return None
+
+    if resp.status_code != 200 or len(resp.content) > _CIMD_MAX_BYTES:
+        logger.warning(f"CIMD fetch rejected for {client_id!r}: status={resp.status_code}")
+        return None
+
+    try:
+        metadata = json.loads(resp.content)
+    except ValueError:
+        logger.warning(f"CIMD document at {client_id!r} is not valid JSON")
+        return None
+
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("client_id") != client_id
+        or not metadata.get("client_name")
+        or not isinstance(metadata.get("redirect_uris"), list)
+    ):
+        logger.warning(f"CIMD document at {client_id!r} failed validation")
+        return None
+
+    max_age_match = re.search(r"max-age=(\d+)", resp.headers.get("cache-control", ""))
+    ttl = min(int(max_age_match.group(1)), _CIMD_CACHE_TTL_MAX) if max_age_match else _CIMD_CACHE_TTL_DEFAULT
+    _cimd_cache[client_id] = {"metadata": metadata, "expires_at": time.time() + ttl}
+    return metadata
 
 
 def _pkce_challenge_from_verifier(code_verifier: str) -> str:
@@ -347,8 +434,10 @@ async def oauth_metadata(request: Request) -> JSONResponse:
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic", "none"],
         "scopes_supported": ["mcp"],
+        "client_id_metadata_document_supported": True,
+        "authorization_response_iss_parameter_supported": True,
     })
 
 
@@ -392,12 +481,33 @@ async def oauth_authorize(request: Request) -> Response:
     code_challenge_method = request.query_params.get("code_challenge_method", "S256")
     resource = request.query_params.get("resource", "")
 
-    if not _redirect_uri_valid(client_id, redirect_uri):
-        logger.warning(f"OAuth authorize rejected: unregistered redirect_uri for client_id={client_id!r}")
-        return JSONResponse(
-            {"error": "invalid_request", "error_description": "redirect_uri is not registered for this client"},
-            status_code=400,
-        )
+    client_name = "an unregistered application"
+    if _is_cimd_client_id(client_id):
+        metadata = await _fetch_cimd_metadata(client_id)
+        if metadata is None:
+            logger.warning(f"OAuth authorize rejected: could not fetch/validate CIMD client_id={client_id!r}")
+            return JSONResponse(
+                {"error": "invalid_client", "error_description": "Could not fetch or validate the client's metadata document"},
+                status_code=400,
+            )
+        if redirect_uri and redirect_uri not in metadata.get("redirect_uris", []):
+            logger.warning(f"OAuth authorize rejected: unregistered redirect_uri for CIMD client_id={client_id!r}")
+            return JSONResponse(
+                {"error": "invalid_request", "error_description": "redirect_uri is not registered for this client"},
+                status_code=400,
+            )
+        client_name = metadata.get("client_name", client_name)
+    else:
+        if not _redirect_uri_valid(client_id, redirect_uri):
+            logger.warning(f"OAuth authorize rejected: unregistered redirect_uri for client_id={client_id!r}")
+            return JSONResponse(
+                {"error": "invalid_request", "error_description": "redirect_uri is not registered for this client"},
+                status_code=400,
+            )
+        registered = oauth_clients.get(client_id)
+        if registered:
+            client_name = registered["name"]
+
     if not _code_challenge_valid(code_challenge) or code_challenge_method != "S256":
         logger.warning(f"OAuth authorize rejected: missing/unsupported PKCE for client_id={client_id!r}")
         return JSONResponse(
@@ -422,7 +532,7 @@ async def oauth_authorize(request: Request) -> Response:
     oauth_pending[login_id] = {
         "redirect_uri": redirect_uri, "client_id": client_id, "state": state,
         "code_challenge": code_challenge, "issued_at": time.time(),
-        "csrf_token": csrf_token,
+        "csrf_token": csrf_token, "client_name": client_name,
     }
     # binds the login transaction to the browser that started it — otherwise
     # anyone who registers a client (DCR is open) could mint their own
@@ -457,10 +567,11 @@ async def oauth_login(request: Request) -> Response:
         return _expired_login_page()
 
     # so the person logging in can see what they're actually authorizing —
-    # DCR is open, so this is the only signal a user gets before their
-    # credentials hand an authorization code to whichever app asked for it
-    client = oauth_clients.get(pending["client_id"])
-    client_name = _html.escape(client["name"] if client else "an unregistered application")
+    # DCR is open and CIMD is self-asserted, so this is the only signal a user
+    # gets before their credentials hand an authorization code to whichever app
+    # asked for it. Resolved once in oauth_authorize (DCR/pre-registered lookup
+    # or CIMD fetch) and carried here rather than re-resolved on every render.
+    client_name = _html.escape(pending.get("client_name", "an unregistered application"))
     redirect_display = _html.escape(pending["redirect_uri"]) if pending["redirect_uri"] else "this page (no redirect)"
     consent_html = f"""
 <div class="info">
@@ -539,7 +650,10 @@ async def oauth_login_post(request: Request) -> Response:
 
     if redirect_uri:
         sep = "&" if "?" in redirect_uri else "?"
-        return RedirectResponse(f"{redirect_uri}{sep}code={code}&state={state}", status_code=303)
+        # RFC 9207 — lets the client tell this response apart from one forged/mixed
+        # up with a different authorization server it also talks to
+        iss = urllib.parse.quote(SERVER_URL, safe="")
+        return RedirectResponse(f"{redirect_uri}{sep}code={code}&state={state}&iss={iss}", status_code=303)
     return HTMLResponse(_page("Signed in", "<h2>Signed in successfully.</h2><p class='sub'>You can close this page.</p>"))
 
 
@@ -619,17 +733,29 @@ async def oauth_token(request: Request) -> JSONResponse:
     # codes minted for a registered client must be redeemed by that same,
     # authenticated client — otherwise a leaked code is bearer-usable by anyone
     if info.get("client_id"):
-        client = oauth_clients.get(client_id)
-        if (
-            client_id != info["client_id"]
-            or not client
-            or not secrets.compare_digest(client_secret, client["client_secret"])
-        ):
-            logger.warning(f"OAuth token rejected: client authentication failed for client_id={client_id!r}")
-            return JSONResponse(
-                {"error": "invalid_client", "error_description": "Client authentication failed"},
-                status_code=401,
-            )
+        if _is_cimd_client_id(info["client_id"]):
+            # CIMD clients are public (token_endpoint_auth_method "none" — there's
+            # no pre-shared secret, the client_id is just a URL anyone can read).
+            # PKCE, checked below, is what actually proves this request came from
+            # whoever received the code, same as any other public client.
+            if client_id != info["client_id"]:
+                logger.warning(f"OAuth token rejected: client_id mismatch for CIMD client={info['client_id']!r}")
+                return JSONResponse(
+                    {"error": "invalid_client", "error_description": "Client authentication failed"},
+                    status_code=401,
+                )
+        else:
+            client = oauth_clients.get(client_id)
+            if (
+                client_id != info["client_id"]
+                or not client
+                or not secrets.compare_digest(client_secret, client["client_secret"])
+            ):
+                logger.warning(f"OAuth token rejected: client authentication failed for client_id={client_id!r}")
+                return JSONResponse(
+                    {"error": "invalid_client", "error_description": "Client authentication failed"},
+                    status_code=401,
+                )
 
     if info.get("code_challenge"):
         # reject an ill-formed verifier before hashing, so a non-ASCII value
